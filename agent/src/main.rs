@@ -1,0 +1,1173 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// Copyright 2026 Bogdan Shapovalov and the Fury authors
+
+//! Fury agent — the local daemon.
+//!
+//! Runs on the operator's machine and is the only component that ever holds
+//! decrypted secrets. Owns the proxy relays, launches the core, keeps profile
+//! locks alive, and serves the local automation API.
+//!
+//! Only the pieces that stand on their own today are wired up; see
+//! docs/09-roadmap.md for what is still missing.
+
+mod blocklist;
+mod bookmarks;
+mod browse;
+mod bundle;
+mod capture;
+mod cookies;
+mod diagnose;
+mod dock;
+mod core_download;
+mod logging;
+mod ext;
+mod geoip;
+mod geodb;
+mod http;
+mod import_browser;
+mod import_antidetect;
+mod install_core;
+mod ipc;
+mod mcp;
+mod launcher;
+mod mirror;
+mod paths;
+mod personas;
+mod rekey;
+mod relay;
+mod store;
+mod syn_shape;
+mod sync;
+#[cfg(test)]
+mod sync_tests;
+#[cfg(test)]
+mod tmp;
+mod unsynced;
+mod transfer;
+mod usage;
+mod vault;
+mod warm;
+mod farm;
+mod webstore;
+mod widevine;
+mod wg_stack;
+mod wg_tunnel;
+mod wireguard;
+
+use std::time::Duration;
+
+use fury_shared::fingerprint::samples;
+use relay::{Credentials, Relay, Upstream};
+
+/// The port for the local automation API, or `None` when it is off.
+///
+/// `FURY_API_PORT=35000` turns it on; `0` and anything unparseable leave it
+/// off, so a typo fails closed.
+///
+/// There is no default port on purpose. A local HTTP port is a way into every
+/// logged-in profile on the machine, and it should exist because somebody asked
+/// for it, not because they installed something. [`http::DEFAULT_PORT`] is the
+/// number to use when you do — see examples/.
+fn api_port() -> Option<u16> {
+    std::env::var("FURY_API_PORT")
+        .ok()
+        .and_then(|v| v.trim().parse::<u16>().ok())
+        .filter(|p| *p > 0)
+}
+
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
+    let log = logging::start();
+    if let Some(path) = &log {
+        // Said at the top of every run, so the first line of the file answers
+        // "which file am I reading" and a terminal is told where the rest went.
+        tracing::info!(path = %path.display(), "logging here as well as to stderr");
+    }
+
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    match args.first().map(String::as_str) {
+        Some("serve") => {
+            // Before anything opens a socket. See fury_platform::fdlimit: 256
+            // from the Finder was the agent's ceiling, and it hit it.
+            if let Some((before, after)) = fury_platform::raise_fd_limit() {
+                tracing::info!(before, after, "open-file limit");
+            }
+            let agent = ipc::Agent::new().await?;
+            // Farming plans run whether or not a window is open. See farm.rs.
+            agent.start_farming();
+            // The exit check's geo database, fetched and kept fresh in the
+            // background. Until it is here the check answers from ipinfo.io
+            // alone, as it always did. See geodb.rs.
+            geodb::spawn_refresher();
+
+            // Only when asked for. See http.rs: a loopback port is reachable
+            // from a page the browser itself opens, and the defences are worth
+            // nothing on a machine whose owner never wanted the port.
+            if let Some(port) = api_port() {
+                let for_api = std::sync::Arc::clone(&agent);
+                tokio::spawn(async move {
+                    if let Err(e) = http::serve(for_api, port).await {
+                        tracing::error!(error = %e, "the local API stopped");
+                    }
+                });
+            }
+
+            agent.serve().await
+        }
+        // An MCP server on stdin/stdout, for Claude Desktop, Cursor and the
+        // rest. See mcp.rs; the desktop's AI assistants screen points them here.
+        Some("mcp") => mcp::serve().await,
+        Some("mcp-skill") => {
+            print!("{}", mcp::SKILL);
+            Ok(())
+        }
+        Some("relay") => cmd_relay(&args[1..]).await,
+        Some("launch") => cmd_launch(&args[1..]).await,
+        Some("check-fingerprint") => cmd_check_fingerprint(&args[1..]),
+        Some("install-core") => match args.get(1) {
+            Some(src) => install_core::install(std::path::Path::new(src)).map(|_| ()),
+            None => install_core::status(),
+        },
+        _ => {
+            eprintln!(
+                "fury-agent {}\n\
+                 \n\
+                 USAGE:\n  \
+                   fury-agent serve\n      \
+                     Run the local daemon: profiles, proxies, launching.\n      \
+                     This is what the desktop app talks to.\n  \
+                   fury-agent mcp\n      \
+                     MCP server on stdin/stdout for Claude Desktop, Cursor, Claude Code.\n      \
+                     Fury's AI assistants settings connect it with one button.\n  \
+                   fury-agent relay <upstream-url> [--port N]\n      \
+                     Start a profile relay. Upstream may be:\n        \
+                       http://user:pass@host:port\n        \
+                       socks5://user:pass@host:port\n  \
+                   fury-agent launch <persona.json> [options]\n      \
+                     Derive a profile from a persona and run the core on it.\n        \
+                       --seed N            profile seed (default 1)\n        \
+                       --proxy URL         upstream proxy; everything goes through it\n        \
+                       --timezone ZONE     IANA zone the profile reports\n        \
+                       --country CC        ISO country: sets --lang and the UI locale\n                              \
+                                           to what a Chrome installed there sends\n        \
+                       --lang a,b          BCP-47 list, most preferred first\n        \
+                       --geo lat,lng       position the profile reports\n        \
+                       --profile-dir DIR   user-data-dir (default a temp dir)\n        \
+                       --core PATH         core binary (or set FURY_CORE)\n        \
+                       --url URL           page to open\n        \
+                       --debug-port N      expose CDP on 127.0.0.1:N\n        \
+                       --extension DIR     load an unpacked extension (repeatable)\n        \
+                       --profile-name NAME name the window as the app does (title, taskbar)\n        \
+                       --real-canvas       the machine's own canvas instead of noise\n  \
+                   fury-agent check-fingerprint <config.json>\n      \
+                     Validate a fingerprint config for internal consistency.\n      \
+                     Pass '-' to check the built-in sample.\n  \
+                   fury-agent install-core [file]\n      \
+                     Install a downloaded core, or report the installed one.\n      \
+                     Takes a .tar.xz, .tar.gz, .app or directory — not a URL.\n",
+                env!("CARGO_PKG_VERSION")
+            );
+            Ok(())
+        }
+    }
+}
+
+async fn cmd_relay(args: &[String]) -> anyhow::Result<()> {
+    let url = args
+        .first()
+        .ok_or_else(|| anyhow::anyhow!("missing upstream url"))?;
+    let port = args
+        .iter()
+        .position(|a| a == "--port")
+        .and_then(|i| args.get(i + 1))
+        .and_then(|p| p.parse().ok())
+        .unwrap_or(0);
+
+    let upstream = parse_upstream(url)?;
+    tracing::info!(?upstream, "starting relay");
+
+    let relay = Relay::new(upstream);
+    let start = relay.start_url();
+    let (bound, handle) = relay.serve(port).await?;
+    tracing::info!(
+        port = bound,
+        start_page = %start,
+        "relay listening — launch the core with --proxy-server=http://127.0.0.1:{bound}"
+    );
+
+    // Kill-switch note: if the upstream dies, sessions fail closed. The relay
+    // stays up so the browser keeps failing rather than silently going direct.
+    handle.await?;
+    Ok(())
+}
+
+/// Derive a profile from a persona and run the core on it.
+///
+/// This is the whole launch path from docs/01 minus the parts that need a
+/// server: acquire the exit, decide what the profile claims about itself, and
+/// hand the core a config it never lets out of the process. Bundle sync and the
+/// distributed lock join later; neither is needed to open a browser.
+async fn cmd_launch(args: &[String]) -> anyhow::Result<()> {
+    let persona_path = args
+        .first()
+        .filter(|a| !a.starts_with("--"))
+        .ok_or_else(|| anyhow::anyhow!("missing persona path"))?;
+
+    let opt = |name: &str| -> Option<String> {
+        args.iter()
+            .position(|a| a == name)
+            .and_then(|i| args.get(i + 1))
+            .cloned()
+    };
+
+    let persona: fury_shared::persona::Persona =
+        serde_json::from_str(&std::fs::read_to_string(persona_path)?)?;
+    let seed: u64 = opt("--seed").map_or(Ok(1), |s| s.parse())?;
+
+    // Start the exit first. The timezone a profile reports has to match where it
+    // actually leaves the network (docs/05), so the proxy has to exist before
+    // the config is derived, not after.
+    let relay = match opt("--proxy") {
+        Some(url) => {
+            let upstream = parse_upstream(&url)?;
+            tracing::info!(?upstream, "starting relay");
+            let relay = Relay::new(upstream);
+            let start_page = relay.start_url();
+            let (port, handle) = relay.serve(0).await?;
+            Some((port, handle, start_page))
+        }
+        None => None,
+    };
+    let relay_port = match &relay {
+        Some((port, _, _)) => *port,
+        None => {
+            // Without a proxy the core would still be pointed at a relay that is
+            // not there, and every request would fail. Refuse rather than
+            // quietly launching a browser that goes out on the real IP.
+            anyhow::bail!(
+                "--proxy is required: the core is launched with --proxy-server pointing at the \
+                 relay, and running without one would send traffic from this machine's own IP"
+            )
+        }
+    };
+
+    // `--country DE` is the short way to say all of it: the languages a German
+    // Chrome sends and the UI locale it runs as, straight out of the generated
+    // table. `--lang` still overrides, for testing a combination on purpose.
+    let country_locale = opt("--country")
+        .as_deref()
+        .and_then(fury_shared::locale::for_country);
+    let locale = country_locale.unwrap_or(fury_shared::locale::FALLBACK);
+
+    let languages: Vec<String> = match opt("--lang") {
+        Some(l) => l.split(',').map(str::trim).map(str::to_string).collect(),
+        None => locale.languages.iter().map(|s| (*s).to_string()).collect(),
+    };
+    // Follows the languages, whether they came from --country or --lang, so a
+    // hand-run launch cannot end up formatting dates in a language it does not
+    // claim to speak.
+    let ui_locale = match (&country_locale, opt("--lang")) {
+        (Some(l), None) => l.ui.to_string(),
+        _ => fury_shared::locale::ui_locale_for(languages.first().map(|s| s.as_str())),
+    };
+
+    let ctx = fury_shared::persona::ProfileContext {
+        // TODO: resolve from the relay's effective exit IP, per docs/05. Until
+        // that lands the operator has to say, and a mismatch is on them. The
+        // launch path in ipc.rs does resolve it; this is the bare CLI.
+        timezone: opt("--timezone").unwrap_or_else(|| "Europe/Berlin".into()),
+        languages,
+        ui_locale: ui_locale.clone(),
+        // The bare CLI resolves no exit; --geo takes "lat,lng" for testing one
+        // on purpose.
+        geolocation: opt("--geo").as_deref().and_then(ipc::parse_location),
+        chrome_major: CHROME_MAJOR,
+        chrome_full_version: CHROME_FULL_VERSION.to_string(),
+    };
+
+    // Fail closed before deriving: a config is a pure function of the persona,
+    // so an inconsistent persona is the only way to get an inconsistent profile.
+    if let Err(errs) = persona.validate() {
+        anyhow::bail!(
+            "persona {} is inconsistent and would stand out:\n  {}",
+            persona.id,
+            errs.iter().map(|e| e.to_string()).collect::<Vec<_>>().join("\n  ")
+        );
+    }
+    let mut config = persona.derive_core_config(seed, &ctx);
+    // What a profile with nothing pinned launches with (the monitor's own
+    // screen), plus the canvas mode a profile picks in its Advanced tab, for
+    // measuring the two side by side from a terminal.
+    fury_shared::overrides::MachineOverrides {
+        canvas: args
+            .iter()
+            .any(|a| a == "--real-canvas")
+            .then_some(fury_shared::overrides::CanvasMode::Real),
+        ..Default::default()
+    }
+    .apply_config(&mut config);
+
+    // The installed core is the last resort and it was missing entirely: this
+    // took --core or FURY_CORE and nothing else, so on a machine where
+    // `install-core` had just succeeded, `fury-agent launch` still answered
+    // "no core binary: pass --core or set FURY_CORE". The shell never hit it --
+    // ipc.rs asks core_binary() -- so the gap was only in the CLI, which is
+    // exactly what a developer reaches for first and what verify-windows.ps1
+    // drives. Found 16.08.2026 on the first Windows verification run.
+    //
+    // Order is unchanged where it matters: an explicit --core still wins over
+    // FURY_CORE, and FURY_CORE still wins over whatever is installed, so
+    // pointing the CLI at a build directory keeps working.
+    let core = opt("--core")
+        .or_else(|| std::env::var("FURY_CORE").ok())
+        .map(std::path::PathBuf::from)
+        .or_else(core_binary)
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "no core binary: install one with `fury-agent install-core <file>`, \
+                 or pass --core, or set FURY_CORE"
+            )
+        })?;
+
+    // The directory is named after a digest of the persona and seed, not after
+    // the persona itself, and that is not tidiness.
+    //
+    // It used to be `fury-profile-{persona.id}-{seed}`, and persona ids describe
+    // the machine they imitate: windows-11-rtx4060-1920x1080. The directory ends
+    // up in --user-data-dir, Chromium passes that switch to EVERY child process,
+    // and a command line is readable by any process this user runs. So the whole
+    // point of carrying the config in an inherited handle -- that argv holds a
+    // slot number and nothing else -- was undone by the folder it ran in.
+    //
+    // Measured 16.08.2026 on Windows: eight processes, and seven of them
+    // advertised "rtx4060-1920x1080" in argv while the browser process itself
+    // was clean. Found by the verify-windows section written to prove the
+    // opposite, which is what that section is for.
+    //
+    // Eight hex characters, the same shape the IPC endpoint tag uses. Same
+    // persona and seed still means the same directory, so a repeated launch
+    // reuses its profile rather than growing a new one each time.
+    let profile_dir = opt("--profile-dir").map(std::path::PathBuf::from).unwrap_or_else(|| {
+        use sha2::Digest;
+        let mut h = sha2::Sha256::new();
+        h.update(persona.id.as_bytes());
+        h.update(b"\0");
+        h.update(seed.to_le_bytes());
+        let tag = h.finalize();
+        std::env::temp_dir().join(format!(
+            "fury-profile-{:02x}{:02x}{:02x}{:02x}",
+            tag[0], tag[1], tag[2], tag[3]
+        ))
+    });
+    std::fs::create_dir_all(&profile_dir)?;
+    launcher::forget_unclean_exit(&profile_dir);
+
+    // The first tab is the start page, as it is from the application, unless
+    // --url says otherwise. Without this the CLI opened chrome://newtab, and
+    // the page that shows what the profile reports -- and links the probe --
+    // was reachable only by knowing a 128-bit token nobody had printed.
+    let urls: Vec<String> = match opt("--url") {
+        Some(u) => vec![u],
+        None => relay.iter().map(|(_, _, start)| start.clone()).collect(),
+    };
+
+    // What the app sets from the profile's name (patch 0904: the window title
+    // and the Windows taskbar), for checking it without the app.
+    if let Some(name) = opt("--profile-name").as_deref().and_then(crate::dock::display_name) {
+        config["window"] = serde_json::json!({ "profileName": name });
+    }
+    let extensions: Vec<std::path::PathBuf> = args
+        .windows(2)
+        .filter(|w| w[0] == "--extension")
+        .map(|w| std::path::PathBuf::from(&w[1]))
+        .collect();
+
+    let spec = launcher::LaunchSpec {
+        // The CLI runs a persona, not a profile: nothing to name.
+        dock_name: None,
+        core_binary: &core,
+        user_data_dir: &profile_dir,
+        config: &config,
+        relay_port,
+        // The CLI launch takes a persona file rather than a stored profile, so
+        // there is no profile whose extensions these would be: --extension
+        // names unpacked directories by hand, for seeing one run under a
+        // persona without an agent, a profile or the Web Store.
+        extensions: &extensions,
+        // A CLI launch is the operator working on their own machine, so nothing
+        // is withheld. The server decides this when a profile comes from a team.
+        restrictions: fury_shared::rbac::LaunchRestrictions::for_perms(
+            fury_shared::rbac::PermSet::full_profile_work(),
+        ),
+        start_urls: &urls,
+        // The bare CLI has no organisation key and no profile key, so there is
+        // nothing to derive one from — the machine's own keychain keeps the
+        // cookies, as it does for any profile that never leaves.
+        os_crypt_key: None,
+        ui_locale: &ui_locale,
+        // Opt-in: CDP is full cookie access, so it is never on by default even
+        // for a local launch.
+        debug_port: opt("--debug-port").and_then(|p| p.parse().ok()),
+        // MCP's background start, by hand: for checking patch 0305 on a
+        // desktop without going through a stored profile.
+        background: args.iter().any(|a| a == "--background"),
+        headless: false,
+    };
+
+    let mut child = launcher::spawn(&spec)?;
+    tracing::info!(
+        pid = child.id(),
+        persona = %persona.id,
+        seed,
+        relay_port,
+        timezone = %ctx.timezone,
+        dir = %profile_dir.display(),
+        first_tab = %urls.first().cloned().unwrap_or_default(),
+        "core running"
+    );
+
+    let status = tokio::task::spawn_blocking(move || child.wait()).await??;
+    tracing::info!(?status, "core exited");
+    Ok(())
+}
+
+/// Where the core binary is, if it can be found.
+///
+/// Looked up rather than configured, because the common case is that the app
+/// bundle ships one next to the agent. FURY_CORE overrides for a development
+/// tree, where the build output is somewhere only the developer knows.
+/// The Chrome version of a core, read without starting it: the PE version
+/// resource on Windows, Info.plist on macOS. None when it cannot be read, and
+/// that is not treated as a mismatch -- a core that will not say is a core the
+/// existing checks already deal with at launch.
+pub fn core_version(exe: &std::path::Path) -> Option<String> {
+    #[cfg(windows)]
+    {
+        return fury_platform::version::file_version(exe).ok();
+    }
+    #[cfg(target_os = "macos")]
+    {
+        // .../Fury.app/Contents/MacOS/Fury -> .../Fury.app/Contents/Info.plist
+        let plist = exe.parent()?.parent()?.join("Info.plist");
+        let text = std::fs::read_to_string(plist).ok()?;
+        let rest = &text[text.find("<key>CFBundleShortVersionString</key>")?..];
+        let start = rest.find("<string>")? + "<string>".len();
+        let end = rest[start..].find("</string>")?;
+        return Some(rest[start..start + end].trim().to_string());
+    }
+    #[allow(unreachable_code)]
+    None
+}
+
+/// The installed core's version, when it is a different Chrome from the one
+/// this agent tells sites it is.
+///
+/// Until 0.2.3 every release reused the same core, so an application update
+/// never needed a new browser. 0.2.3 moves to Chrome 155 and announces it --
+/// the user agent, the client hints, the brand list are all derived from
+/// CHROME_MAJOR -- and an application updated on its own would have gone on
+/// launching the 153 engine behind that claim. The engine's own features give
+/// the version away, so the claim becomes a contradiction. Such a core is
+/// reported as not there: the shell then shows its download button, and the
+/// download replaces it.
+///
+/// A core named explicitly by FURY_CORE is exempt. That is a developer running
+/// a build of their choosing, and it has to keep working mid-rebase.
+pub fn core_outdated(exe: &std::path::Path) -> Option<String> {
+    if std::env::var("FURY_CORE").is_ok_and(|v| std::path::Path::new(&v) == exe) {
+        return None;
+    }
+    let version = core_version(exe)?;
+    let major: u32 = version.split('.').next()?.parse().ok()?;
+    (major != CHROME_MAJOR).then_some(version)
+}
+
+/// The oldest core build this agent expects, named by the release that first
+/// shipped it. Bumped whenever the core is rebuilt on the same Chrome -- the
+/// seventh file a core rebuild touches, beside CHROME_MAJOR for a new Chrome.
+///
+/// core_outdated only compares Chrome majors, and from 0.2.4 to 0.2.10 the
+/// Windows core was rebuilt three times on Chrome 155: Fury's icon (0.2.4),
+/// canvas noise pixelscan stopped seeing (0.2.9), edge noise that keeps the
+/// colour (0.2.10). Nothing told an installed copy. A tester ran the 0.2.3 core
+/// until 02.10.2026 and noticed only the icon -- Chromium's blue ball on his
+/// taskbar -- while the canvas fixes he had been told about were missing too.
+///
+/// 0.2.21 rebuilt both on Chrome 155.0.8059.39, the stable release with 247
+/// security fixes that the 155.0.8059.12 cores lacked, and carries 0903 (a
+/// macOS profile's browser quits with its last window, with its own icon).
+///
+/// 0.2.24 rebuilt both on the same Chrome: WebGL's UNMASKED pair hidden until
+/// its extension is enabled (#16), Android personas (0130-0134), and the
+/// screen's pixel density no longer showing through a persona's (0020, 0131).
+///
+/// 0.3.5 rebuilt both on the same Chrome: an extension's popup is no longer
+/// taken over by the persona's scale factor (0131; Bitwarden opened as an
+/// empty square), and a phone persona's motion sensors (0135).
+///
+/// Per platform from 0.3.7, when only the Windows core was rebuilt (0904, the
+/// profile's name on the taskbar). One number for both would have offered
+/// every Mac a 105 MB download of the core it already had.
+///
+/// 0.3.8 rebuilt only the macOS core: 0903, a profile restoring its session
+/// quits with its last window too.
+///
+/// 0.4.12 rebuilt both: what demo.fingerprint.com named tampering -- client
+/// rects off the layout grid (0033), WebGL extensions out of Chrome's order
+/// (0031) -- and Chrome's own Google voices (0042).
+///
+/// 0.5.0 moves both to Chrome 157.0.8103.39, with navigator.connection from the
+/// profile (0122), hidden fonts refused before the platform cache (0051) and a
+/// phone's orientation events at a phone's rate (0135). CHROME_MAJOR already
+/// sends every older core to the download, so this only keeps the number honest.
+///
+/// 0.5.4 rebuilds both on the same Chrome: Local Font Access lists only the
+/// fonts the profile shows (0052), built-in AI answers "downloadable" as
+/// Chrome does (0123), and WebRTC gathers Chrome's host and srflx candidates
+/// carrying the proxy's exit address (0071). Issues 31-33.
+///
+/// 0.6.0 rebuilds both on the same Chrome: Widevine sends the device ID
+/// encrypted, as Chrome does (CDM host verification and storage ID on, patches
+/// 0063 and 0064). Before it, any page could read one identifier shared by
+/// every profile on the machine, and iphey called the browser "whale".
+///
+/// 0.6.1 rebuilds macOS only: the CDM runs in "Fury Helper (Plugin)", signed
+/// without library validation (0065), because no other helper may load a
+/// Google-signed library and DRM never played on a Mac. Windows keeps 0.6.0.
+///
+/// 0.6.8 rebuilds both: the unmasked WebGL strings cost a GPU round trip as in
+/// Chrome (0031, BrowserScan's "WebGL exception", #42), and the window shows
+/// the profile's name beside its controls and in its title (0904, 0905).
+///
+/// 0.6.9 rebuilds both: a desktop profile's pointer and hover media queries
+/// follow its touch points instead of the host's input devices (0130, #43).
+pub const CORE_BUILD: &str = "0.6.9";
+
+/// `0.2.10` as (0, 2, 10); None for anything else.
+pub fn parse_release(s: &str) -> Option<(u32, u32, u32)> {
+    let mut parts = s.trim().split('.').map(|p| p.parse::<u32>().ok());
+    let r = (parts.next()??, parts.next()??, parts.next()??);
+    parts.next().is_none().then_some(r)
+}
+
+/// The installed core is the right Chrome but an older build than CORE_BUILD.
+///
+/// `Some(Some(release))` names the build; `Some(None)` is a core installed
+/// before releases were recorded, which is every core installed by 0.2.15 or
+/// earlier -- it may be current, but nothing says so, and one download settles
+/// it. Unlike core_outdated this does not stop a launch: the old build is the
+/// same Chrome, and profiles keep working while the shell offers the new one.
+///
+/// Only the core this agent installed is judged. FURY_CORE, a core found
+/// elsewhere, and a core installed by hand from something that did not name
+/// its release ("manual") are somebody's deliberate choice.
+pub fn core_stale(exe: &std::path::Path) -> Option<Option<String>> {
+    if std::env::var("FURY_CORE").is_ok_and(|v| std::path::Path::new(&v) == exe) {
+        return None;
+    }
+    if !exe.starts_with(paths::core_dir()) || core_outdated(exe).is_some() {
+        return None;
+    }
+    let need = parse_release(CORE_BUILD)?;
+    match std::fs::read_to_string(paths::core_release_file()) {
+        Err(_) if core_is_current_build(exe) => {
+            // Said once and written down, so the next poll reads a file
+            // instead of hashing a few hundred megabytes again.
+            let _ = std::fs::write(paths::core_release_file(), CORE_BUILD);
+            None
+        }
+        Err(_) => Some(None),
+        Ok(text) if text.trim() == "manual" => None,
+        Ok(text) => match parse_release(&text) {
+            Some(have) if have >= need => None,
+            Some(_) => Some(Some(text.trim().to_string())),
+            None => Some(None),
+        },
+    }
+}
+
+/// The library that carries the engine in a CORE_BUILD core, by platform:
+/// (path from the core's executable, SHA-256). The rest of the archive is
+/// resources, and every Fury patch lands in this one file.
+///
+/// Why this exists: a core installed before 0.2.16 has no record of its build,
+/// so every such install was told "possibly an older build" -- including the
+/// ones that were current. The owner of this project saw the bar on a core
+/// byte-identical to 0.2.10 (08.10.2026) and rightly asked why. Comparing the
+/// file settles it without a 150 MB download. Update these with CORE_BUILD.
+#[cfg(target_os = "macos")]
+const CORE_BUILD_ENGINE: Option<(&str, &str)> = Some((
+    "../Frameworks/Fury Framework.framework/Versions/Current/Fury Framework",
+    "f8fb49c7692bbb612d4ba925063914b0b674e55786d66e15f42c944a594875d1",
+));
+#[cfg(windows)]
+const CORE_BUILD_ENGINE: Option<(&str, &str)> = Some((
+    "chrome.dll",
+    "1c9938bed399208ddc87df0c7a2b1f12dee1e7c3a7439eb21d4c710bd2360c98",
+));
+#[cfg(not(any(target_os = "macos", windows)))]
+const CORE_BUILD_ENGINE: Option<(&str, &str)> = None;
+
+/// Whether an unrecorded core is in fact CORE_BUILD. Hashed at most once per
+/// run: a core that does not match keeps its bar without being read again on
+/// every status poll.
+fn core_is_current_build(exe: &std::path::Path) -> bool {
+    static VERDICT: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *VERDICT.get_or_init(|| {
+        let Some((rel, want)) = CORE_BUILD_ENGINE else { return false };
+        let Some(dir) = exe.parent() else { return false };
+        engine_matches(&dir.join(rel), want)
+    })
+}
+
+fn engine_matches(path: &std::path::Path, want: &str) -> bool {
+    use sha2::Digest;
+    use std::io::Read;
+    let Ok(mut f) = std::fs::File::open(path) else { return false };
+    let mut hasher = sha2::Sha256::new();
+    let mut buf = vec![0u8; 1 << 20];
+    loop {
+        match f.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => hasher.update(&buf[..n]),
+            Err(_) => return false,
+        }
+    }
+    let got: String = hasher.finalize().iter().map(|b| format!("{b:02x}")).collect();
+    got == want
+}
+
+fn core_version_problem(exe: &std::path::Path) -> Option<String> {
+    let have = core_outdated(exe)?;
+    Some(format!(
+        "The installed browser is Chrome {have}, and this version of Fury needs Chrome \
+         {CHROME_MAJOR}. Download the new one; it replaces the old."
+    ))
+}
+
+pub fn core_binary() -> Option<std::path::PathBuf> {
+    if let Ok(explicit) = std::env::var("FURY_CORE") {
+        let path = std::path::PathBuf::from(explicit);
+        if path.exists() {
+            return Some(path);
+        }
+        // A setting that names nothing does NOT stop the search, and this is a
+        // reversal of how it was written a day earlier.
+        //
+        // The argument then was that silently running a different browser from
+        // the one the environment names is worse than running none. That is
+        // true when the named binary exists and a different one gets used. It
+        // is not this case: the named path does not exist, so there is no
+        // browser it could have meant, and the choice is between a working
+        // application and a dead one.
+        //
+        // What it cost, measured rather than imagined. A FURY_CORE left in
+        // launchd from before the branding patch renamed Chromium.app made the
+        // application unusable; the first fix could not work, because a GUI
+        // process takes its environment from launchd and not from any shell;
+        // and the second could not work either, because the agent is a separate
+        // long-lived process that an application restart does not touch. Three
+        // rounds, for a variable naming a file that is not there.
+        //
+        // So: carry on looking, and say so loudly. core_lookup_problem() keeps
+        // reporting it, the desktop shows it in a bar, and this line puts it in
+        // the log for anybody driving the CLI. Not silent, and not stuck.
+        tracing::warn!(
+            wanted = %path.display(),
+            "FURY_CORE names a path that does not exist; looking for a core elsewhere"
+        );
+    }
+
+    // Beside the agent first, because a development tree and a bundle that
+    // shipped both together are both that shape, and an explicitly placed
+    // binary should win over an installed one.
+    if let Some(dir) = std::env::current_exe().ok().and_then(|e| e.parent().map(std::path::Path::to_path_buf)) {
+        if let Some(path) = core_leaves().iter().map(|l| dir.join(l)).find(|p| p.exists()) {
+            return Some(path);
+        }
+    }
+
+    // Then the installed location. This is the ordinary case for anybody who
+    // did not build the browser: the shell is 12 MB and downloads with the
+    // application, the core is 134 MB and arrives separately.
+    //
+    // The directory gained a `.bundle` extension so that Spotlight stops
+    // offering the browser as a second application called Fury; anything
+    // installed before that has to be brought along, or it silently stops
+    // being found.
+    crate::install_core::migrate_legacy_dir();
+    let dir = crate::paths::core_dir();
+    core_leaves().iter().map(|l| dir.join(l)).find(|p| p.exists())
+}
+
+/// Something wrong with how the core is being found, in a sentence.
+///
+/// No longer a reason there is no core — [`core_binary`] carries on looking —
+/// but still worth saying, because a FURY_CORE naming a deleted build is
+/// somebody's leftover and will confuse them again next week.
+pub fn core_lookup_problem() -> Option<String> {
+    let Ok(explicit) = std::env::var("FURY_CORE") else {
+        return core_binary().and_then(|exe| core_version_problem(&exe));
+    };
+    if std::path::Path::new(&explicit).exists() {
+        return None;
+    }
+    let found = core_binary().is_some();
+    Some(format!(
+        "FURY_CORE is set to {explicit}, which does not exist. {} {}.",
+        if found {
+            "It is being ignored and the installed browser used instead."
+        } else {
+            "There is no installed browser to fall back to either."
+        },
+        how_to_unset(&explicit)
+    ))
+}
+
+/// How to actually get rid of it, which is not always what it looks like.
+///
+/// "unset it" is true of a shell and useless to somebody running the desktop
+/// application: a GUI process on macOS inherits its environment from launchd,
+/// not from any shell, so `unset FURY_CORE` in Terminal changes nothing and the
+/// application keeps failing in exactly the same way. `launchctl setenv` is how
+/// the value gets there — a debugging command typed once and forgotten — and
+/// `launchctl unsetenv` is the only thing that removes it.
+///
+/// Found the hard way: a FURY_CORE left over from before the branding patch
+/// renamed Chromium.app to Fury.app, living in launchd and in no dotfile, so it
+/// was invisible to every obvious place to look.
+///
+/// And then found the hard way a second time. "Restart Fury" was the next
+/// sentence, and it was also wrong: the agent is a separate process that
+/// deliberately outlives the window (docs/01 — it holds locks and serves the
+/// automation API with the UI closed), so quitting and reopening the
+/// application finds the same agent still holding the same environment. A
+/// process cannot be told to forget a variable it started with; it has to end.
+fn how_to_unset(current: &str) -> String {
+    // Whatever the source, the agent has to be restarted for the change to
+    // reach it, and that is the part everybody gets wrong.
+    const THEN_RESTART: &str = "Then quit Fury and stop the agent — \
+                                `pkill -f fury-agent` — because it is a separate \
+                                process that an application restart does not touch";
+
+    #[cfg(target_os = "macos")]
+    {
+        let from_launchd = std::process::Command::new("launchctl")
+            .args(["getenv", "FURY_CORE"])
+            .output()
+            .ok()
+            .filter(|o| o.status.success())
+            .map(|o| String::from_utf8_lossy(&o.stdout).trim() == current)
+            .unwrap_or(false);
+
+        if from_launchd {
+            return format!(
+                "It comes from launchd, so `unset FURY_CORE` in a terminal will not \
+                 reach this application — run `launchctl unsetenv FURY_CORE`. {THEN_RESTART}"
+            );
+        }
+    }
+    let _ = current;
+    format!("Unset it, or point it at a core. {THEN_RESTART}")
+}
+
+/// The path from a directory holding a core to the executable inside it.
+///
+/// macOS wraps the browser in an application bundle; Windows is a directory
+/// with the executable at the top. The `.exe` is not optional — `Path::exists`
+/// is how the core is found, and a file named `fury` with no extension does not
+/// exist under the name `fury.exe` that everything else would then look for.
+fn core_leaf() -> &'static str {
+    core_leaves()[0]
+}
+
+/// Every name a core may go by, most-preferred first.
+///
+/// The second name in each list is the UNBRANDED one: chrome.exe, Chromium.app.
+/// A core has it whenever patch 0900 has not been applied to the tree it was
+/// built from, and that is not a hypothetical -- it is what shipped.
+///
+/// Found 16.08.2026 by installing a published release onto a Windows machine:
+///
+///     Error: no core found in fury-core-0.1.0-pre2-windows-x64.tar.xz
+///     -- expected fury.exe somewhere inside it
+///
+/// The first diagnosis of that, written here and committed, said patch 0900 did
+/// not exist and that the macOS core was branded only by uncommitted edits in
+/// one developer's checkout. That was wrong, and wrong in the way this file is
+/// supposed to be against: it was inferred from `git status` showing modified
+/// files -- which is what an applied 27-patch series looks like -- instead of
+/// from opening core/patches/. 0900 is written, is in the series, and sets
+/// PRODUCT_FULLNAME and MAC_BUNDLE_ID.
+///
+/// What actually happened is duller and worse: apply.sh stopped at 0110, so the
+/// Windows tree got 20 patches of 27 and never reached 0900. The core in that
+/// release is missing os_crypt, performance.memory, battery, the automation
+/// traces and both locks as well as its name.
+///
+/// So the list stays, and its justification changes. An agent's job is to drive
+/// the core it was given, and a browser that is otherwise correct should not be
+/// refused over a filename -- a developer building without the branding patch
+/// has a usable core. It is a tolerance, not a substitute for applying 0900.
+fn core_leaves() -> &'static [&'static str] {
+    #[cfg(target_os = "macos")]
+    {
+        &[
+            "Fury.app/Contents/MacOS/Fury",
+            "Chromium.app/Contents/MacOS/Chromium",
+        ]
+    }
+    #[cfg(windows)]
+    {
+        // The subdirectory is not decoration and not a mistake: the Windows
+        // archive carries a top-level `Fury\` exactly as the macOS one carries
+        // `Fury.app`, so the leaf is relative to core.bundle and includes it.
+        //
+        // Without the first two entries `install-core` unpacks a perfectly good
+        // core, reports "installed 150.0.7871.187", and every launch afterwards
+        // says "no core binary: pass --core or set FURY_CORE" -- an installation
+        // that succeeded and a browser that cannot be found, which is the worst
+        // combination to debug. Measured 16.08.2026 by verify-windows.ps1, the
+        // first run in which a Windows core existed to install.
+        //
+        // The bare names stay last, for a build directory handed over with
+        // FURY_CORE and for anything installed before the archive gained its
+        // top-level directory.
+        &[
+            "Fury/chrome.exe",
+            "Fury/fury.exe",
+            "fury.exe",
+            "chrome.exe",
+        ]
+    }
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        &["fury-core", "chrome"]
+    }
+}
+
+/// The core this agent expects to drive. Read from core/CHROMIUM_VERSION at
+/// build time would be better; hard-coded until the two are built together.
+pub const CHROME_MAJOR: u32 = 157;
+pub const CHROME_FULL_VERSION: &str = "157.0.8103.39";
+
+fn cmd_check_fingerprint(args: &[String]) -> anyhow::Result<()> {
+    let path = args
+        .first()
+        .ok_or_else(|| anyhow::anyhow!("missing config path (or '-' for the sample)"))?;
+
+    let config = if path == "-" {
+        samples::macos_arm64()
+    } else {
+        serde_json::from_str(&std::fs::read_to_string(path)?)?
+    };
+
+    match config.validate() {
+        Ok(()) => {
+            println!("consistent — no contradictions found");
+            Ok(())
+        }
+        Err(errs) => {
+            eprintln!("{} inconsistency(ies) — this profile would stand out:", errs.len());
+            for e in &errs {
+                eprintln!("  - {e}");
+            }
+            std::process::exit(1);
+        }
+    }
+}
+
+/// Parse `scheme://[user:pass@]host:port`.
+///
+/// Deliberately hand-rolled rather than pulled from a URL crate: proxy strings
+/// in the wild contain characters real URL parsers reject, and silently
+/// mis-parsing one means connecting somewhere unintended.
+pub fn parse_upstream(url: &str) -> anyhow::Result<Upstream> {
+    // "No proxy", spelled. A profile that is allowed to open without one still
+    // goes through the relay — for the blocklist, the start page and the
+    // refusal to reach this machine's own services — so it needs an upstream
+    // to name, and this is it.
+    if url == "direct" || url == "direct://" {
+        return Ok(Upstream::Direct);
+    }
+
+    let (scheme, rest) = url
+        .split_once("://")
+        .ok_or_else(|| anyhow::anyhow!("expected scheme://, got {url:?}"))?;
+
+    let (auth, hostport) = match rest.rsplit_once('@') {
+        Some((a, hp)) => {
+            let (u, p) = a
+                .split_once(':')
+                .ok_or_else(|| anyhow::anyhow!("credentials must be user:pass"))?;
+            (
+                Some(Credentials {
+                    username: u.to_string(),
+                    password: p.to_string(),
+                }),
+                hp,
+            )
+        }
+        None => (None, rest),
+    };
+
+    let (host, port) = hostport
+        .rsplit_once(':')
+        .ok_or_else(|| anyhow::anyhow!("expected host:port"))?;
+    let port: u16 = port.parse()?;
+    let host = host.to_string();
+
+    Ok(match scheme {
+        "http" => Upstream::Http { host, port, auth, tls: false },
+        // TLS to the proxy itself; see `Upstream::Http`.
+        "https" => Upstream::Http { host, port, auth, tls: true },
+        // socks5 is treated as socks5h unconditionally: local DNS resolution
+        // would leak the operator's resolver. See docs/05.
+        "socks5" | "socks5h" => Upstream::Socks5 { host, port, auth },
+        // The config rides in the password (`wireguard::url`); host and port
+        // are only the endpoint repeated for display. Windows until a launch
+        // says which persona this is (`Upstream::for_os`): a check has no
+        // persona, and Windows is what most of them are.
+        "wireguard" => {
+            let auth = auth.ok_or_else(|| anyhow::anyhow!("a wireguard:// URL carries its config"))?;
+            let config = wireguard::from_url_secret(&auth.password)?;
+            Upstream::WireGuard(wg_stack::Shared::for_config(config), syn_shape::Os::Windows)
+        }
+        other => anyhow::bail!("unsupported proxy scheme {other:?}"),
+    })
+}
+
+#[allow(dead_code)]
+const LOCK_HEARTBEAT: Duration = Duration::from_secs(30);
+
+/// Held by every test in this crate that writes FURY_CORE or FURY_HOME.
+///
+/// The variables belong to the process and the test harness runs threads, so
+/// two of these at once is one test deciding another's answer. It is not
+/// hypothetical: a test added on 22.09.2026 turned an unrelated one red once
+/// and passed the next run, which is the worst shape a failure comes in.
+/// `PoisonError` is unwrapped past because a panic in one of these says nothing
+/// about whether the lock's data -- there is none -- is sound.
+#[cfg(test)]
+pub(crate) static ENV: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+#[cfg(test)]
+mod tests {
+    use super::ENV;
+
+    /// Held by every test that writes FURY_CORE or FURY_HOME.
+    ///
+    /// A core installed while the agent is running is found without a restart.
+    ///
+    /// The bug this pins, reported and reproduced on 22.09.2026: the agent read
+    /// this once at startup and kept the answer in a field, so the core it had
+    /// just downloaded and installed itself did not exist as far as it was
+    /// concerned -- the bar said "not installed yet", a launch said "no core
+    /// binary found", and the download button downloaded the same 146 MB again.
+    #[test]
+    fn a_core_that_appears_after_the_first_look_is_found() {
+        let _guard = ENV.lock().unwrap_or_else(|e| e.into_inner());
+        let home = std::env::temp_dir().join("fury-core-appears-test");
+        std::fs::remove_dir_all(&home).ok();
+        std::fs::create_dir_all(&home).unwrap();
+        // SAFETY: single-threaded test; both variables are read back at once.
+        // FURY_CORE is cleared because a developer's own export would decide
+        // the answer before the directory is ever looked at.
+        unsafe {
+            std::env::set_var("FURY_HOME", &home);
+            std::env::remove_var("FURY_CORE");
+        }
+
+        assert_eq!(super::core_binary(), None, "nothing is installed yet");
+
+        let dir = crate::paths::core_dir();
+        let leaf = dir.join(super::core_leaf());
+        std::fs::create_dir_all(leaf.parent().unwrap()).unwrap();
+        std::fs::write(&leaf, b"#!/bin/sh\n").unwrap();
+
+        assert_eq!(super::core_binary(), Some(leaf));
+
+        unsafe { std::env::remove_var("FURY_HOME") };
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn a_core_path_that_exists_is_not_a_problem() {
+        let _guard = ENV.lock().unwrap_or_else(|e| e.into_inner());
+        // The guard that keeps this off the ordinary path: a FURY_CORE pointing
+        // at a real binary is a normal development setup, not a fault.
+        let real = std::env::current_exe().unwrap();
+        // SAFETY: single-threaded test, and the variable is read back at once.
+        unsafe { std::env::set_var("FURY_CORE", &real) };
+        assert_eq!(super::core_lookup_problem(), None);
+        unsafe { std::env::remove_var("FURY_CORE") };
+    }
+
+    #[test]
+    fn a_core_path_that_does_not_exist_names_itself_and_a_way_out() {
+        let _guard = ENV.lock().unwrap_or_else(|e| e.into_inner());
+        unsafe { std::env::set_var("FURY_CORE", "/nowhere/Chromium.app/Contents/MacOS/Chromium") };
+        let said = super::core_lookup_problem().expect("a missing path is a problem");
+        // The path, because "no core found" sends people to look in the wrong
+        // place — which is exactly what happened before this existed.
+        assert!(said.contains("/nowhere/Chromium.app"), "{said}");
+        // Something to do about it.
+        assert!(said.contains("unsetenv") || said.contains("Unset it"), "{said}");
+        // And the part that took two failed attempts to get right: the agent
+        // outlives the window, so "restart Fury" is not enough and the advice
+        // must say what is.
+        assert!(said.contains("pkill -f fury-agent"), "{said}");
+        unsafe { std::env::remove_var("FURY_CORE") };
+    }
+
+    #[test]
+    fn a_core_path_that_does_not_exist_does_not_block_the_search() {
+        // The reversal. A variable naming a file that is not there used to make
+        // the application unusable; now it is ignored and reported. Nothing
+        // else could be found in a test environment either, so what is asserted
+        // is that the variable itself is no longer the thing standing in the
+        // way — the lookup proceeds past it rather than returning at it.
+        unsafe { std::env::set_var("FURY_CORE", "/nowhere/at/all") };
+        let with_bad_var = super::core_binary();
+        unsafe { std::env::remove_var("FURY_CORE") };
+        let without = super::core_binary();
+        assert_eq!(
+            with_bad_var, without,
+            "a FURY_CORE pointing nowhere changed the outcome; it should be ignored"
+        );
+    }
+
+    use super::*;
+
+    #[test]
+    fn parses_authenticated_socks5() {
+        let u = parse_upstream("socks5://bob:s3cr3t@10.0.0.1:1080").unwrap();
+        match u {
+            Upstream::Socks5 { host, port, auth } => {
+                assert_eq!(host, "10.0.0.1");
+                assert_eq!(port, 1080);
+                let a = auth.unwrap();
+                assert_eq!(a.username, "bob");
+                assert_eq!(a.password, "s3cr3t");
+            }
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    /// "No proxy" has to be sayable, because the relay still runs in that mode
+    /// — it carries the blocklist and the start page — and it needs an upstream
+    /// to name.
+    #[test]
+    fn no_proxy_at_all_is_an_upstream_like_any_other() {
+        assert!(matches!(parse_upstream("direct").unwrap(), Upstream::Direct));
+        assert!(matches!(parse_upstream("direct://").unwrap(), Upstream::Direct));
+        // And nothing else becomes it by accident.
+        assert!(parse_upstream("direct://host:1080").is_err());
+    }
+
+    #[test]
+    fn a_login_is_taken_as_written() {
+        // A supplier's session parameters ride in the login. The parser does
+        // not percent-decode, so the form must not encode: "%3B" here was a
+        // login the proxy did not know (13.10.2026).
+        let u = parse_upstream("socks5://c8734fb39d__cr.us;sessttl.60:pw@gw.psbproxy.io:10000").unwrap();
+        match u {
+            Upstream::Socks5 { host, port, auth } => {
+                assert_eq!((host.as_str(), port), ("gw.psbproxy.io", 10000));
+                assert_eq!(auth.unwrap().username, "c8734fb39d__cr.us;sessttl.60");
+            }
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn passwords_may_contain_at_signs() {
+        // rsplit_once('@') matters: 'p@ss' would otherwise split in the wrong place.
+        let u = parse_upstream("http://bob:p@ss@proxy.example:8080").unwrap();
+        match u {
+            Upstream::Http { host, auth, .. } => {
+                assert_eq!(host, "proxy.example");
+                assert_eq!(auth.unwrap().password, "p@ss");
+            }
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn anonymous_proxies_parse() {
+        assert!(matches!(
+            parse_upstream("socks5://127.0.0.1:9050").unwrap(),
+            Upstream::Socks5 { auth: None, .. }
+        ));
+    }
+
+    #[test]
+    fn unknown_schemes_are_refused() {
+        assert!(parse_upstream("ftp://x:1").is_err());
+        assert!(parse_upstream("no-scheme:1080").is_err());
+    }
+
+    #[test]
+    fn the_sample_persona_is_self_consistent() {
+        samples::macos_arm64().validate().unwrap();
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_core_of_another_chrome_is_outdated_and_this_one_is_not() {
+        let root = std::env::temp_dir().join("fury-core-version-test");
+        std::fs::remove_dir_all(&root).ok();
+        let exe_for = |version: &str| {
+            let app = root.join(version).join("Fury.app/Contents");
+            std::fs::create_dir_all(app.join("MacOS")).unwrap();
+            std::fs::write(
+                app.join("Info.plist"),
+                format!(
+                    "<?xml version=\"1.0\"?>\n<plist><dict>\n\t<key>CFBundleShortVersionString</key>\n\t<string>{version}</string>\n</dict></plist>\n"
+                ),
+            )
+            .unwrap();
+            let exe = app.join("MacOS/Fury");
+            std::fs::write(&exe, b"").unwrap();
+            exe
+        };
+        let old = exe_for("153.0.8010.37");
+        let current = exe_for(&format!("{}.0.8059.12", super::CHROME_MAJOR));
+        assert_eq!(super::core_version(&old).as_deref(), Some("153.0.8010.37"));
+        assert_eq!(super::core_outdated(&old).as_deref(), Some("153.0.8010.37"));
+        assert_eq!(super::core_outdated(&current), None);
+        // A core whose version cannot be read is not called outdated.
+        assert_eq!(super::core_outdated(&root.join("nowhere/Fury.app/Contents/MacOS/Fury")), None);
+        std::fs::remove_dir_all(&root).ok();
+    }
+}
+
+#[cfg(test)]
+mod core_build_tests {
+    use super::*;
+
+    #[test]
+    fn releases_compare_as_numbers_not_text() {
+        assert!(parse_release("0.2.9") < parse_release("0.2.10"));
+        assert_eq!(parse_release("0.2.15"), Some((0, 2, 15)));
+        assert_eq!(parse_release("manual"), None);
+        assert_eq!(parse_release("0.2"), None);
+        assert_eq!(parse_release("0.2.10.1"), None);
+        assert!(parse_release(CORE_BUILD).is_some(), "CORE_BUILD must parse");
+    }
+
+    #[test]
+    fn an_engine_is_recognised_by_its_hash_and_nothing_else() {
+        let dir = std::env::temp_dir().join(format!("fury-engine-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let f = dir.join("engine");
+        std::fs::write(&f, b"abc").unwrap();
+        // sha256("abc")
+        let abc = "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad";
+        assert!(super::engine_matches(&f, abc));
+        std::fs::write(&f, b"abd").unwrap();
+        assert!(!super::engine_matches(&f, abc));
+        assert!(!super::engine_matches(&dir.join("missing"), abc));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}

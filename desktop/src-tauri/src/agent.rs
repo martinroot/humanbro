@@ -1,0 +1,341 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// Copyright 2026 Bogdan Shapovalov and the Fury authors
+
+//! Talking to the local agent.
+//!
+//! The agent is a separate process because it outlives this window: it holds
+//! profile locks, keeps relays up and serves the automation API while the UI is
+//! closed (docs/01). The shell is one of its clients, not its owner.
+//!
+//! One connection per request. The protocol is newline-delimited JSON and the
+//! calls are short, so a pool would buy nothing and would add the one failure
+//! mode this must not have — a stale connection to an agent that has restarted,
+//! reported to the operator as "the agent is not running".
+
+use std::path::PathBuf;
+use std::time::Duration;
+
+use serde::de::DeserializeOwned;
+use serde_json::Value;
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+
+#[derive(Debug, thiserror::Error)]
+pub enum AgentError {
+    /// Nothing is listening. Distinct from every other failure because it is
+    /// the only one with an action attached: start the agent.
+    #[error("the local agent is not running")]
+    NotRunning,
+
+    /// The agent understood the call and said no. `code` is present when the
+    /// refusal is one the interface has a translation for; the message is the
+    /// fallback, and is what gets shown without one.
+    #[error("{message}")]
+    Refused { message: String, code: Option<String> },
+
+    #[error("agent connection failed: {0}")]
+    Io(#[from] std::io::Error),
+
+    #[error("agent spoke a shape this version does not understand: {0}")]
+    Protocol(String),
+}
+
+// What the agent answers with. Mirrors `agent/src/store.rs`; deserialised into
+// named types rather than passed through as JSON so a field renamed on one side
+// stops the build instead of quietly emptying a column.
+
+#[derive(Debug, serde::Deserialize)]
+pub struct LocalProject {
+    pub id: String,
+    pub name: String,
+    pub profile_count: i64,
+}
+
+#[derive(Debug, serde::Deserialize)]
+pub struct LocalProxy {
+    pub id: String,
+    pub name: String,
+    pub kind: String,
+    pub host: String,
+    pub port: u16,
+    #[serde(default)]
+    pub has_rotation: bool,
+    pub last_country: Option<String>,
+    #[serde(default)]
+    pub last_ip: Option<String>,
+    /// The exit's zone from the last check, for the editor to name what
+    /// "follow the exit" will resolve to.
+    #[serde(default)]
+    pub last_timezone: Option<String>,
+    /// Only ever filled for a proxy of THIS machine's, where the agent keeps
+    /// them readable because there is nobody to hide them from.
+    ///
+    /// Read for exactly one purpose: sending a local profile to a server, where
+    /// the exit has to be re-sealed under the organisation key or nobody else's
+    /// machine can open it. Defaulted rather than required, because the same
+    /// struct is deserialised from listings that do not carry them.
+    #[serde(default)]
+    pub username: Option<String>,
+    #[serde(default)]
+    pub password: Option<String>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+pub struct LocalProfile {
+    pub id: String,
+    /// Absent when the profile is in no project — which is an ordinary state,
+    /// not an error: the Profiles list is every profile, and a project is a
+    /// grouping one can be moved out of.
+    #[serde(default)]
+    pub project_id: Option<String>,
+    #[serde(default)]
+    pub project_name: Option<String>,
+    pub name: String,
+    #[serde(default)]
+    pub notes: String,
+    /// The account's stage, free text; empty is none (docs/16 5.5).
+    #[serde(default)]
+    pub status: String,
+    pub tags: Vec<String>,
+    pub persona_id: String,
+    pub fp_seed: i64,
+    pub proxy: Option<LocalProxy>,
+    /// May this one open with no proxy? Never set on a team row, and absent
+    /// from every response written before the flag existed.
+    #[serde(default)]
+    pub allow_no_proxy: bool,
+    #[serde(default)]
+    pub start_urls: Vec<String>,
+    /// Absent from the trash listing, where nothing is running by definition.
+    /// Declared as a plain `bool` at first, and a missing plain field is a hard
+    /// serde error — so every trash response failed to parse and the view
+    /// reported an empty trash instead of a broken one.
+    #[serde(default)]
+    pub timezone: Option<String>,
+    #[serde(default)]
+    pub languages: Option<Vec<String>>,
+    #[serde(default)]
+    pub overrides: fury_shared::overrides::MachineOverrides,
+    /// Domain lists the relay applies. The first UI for them (12.09.2026)
+    /// showed every box unchecked because this field was not carried here.
+    #[serde(default)]
+    pub blocklists: Vec<String>,
+    #[serde(default)]
+    pub running: bool,
+    pub last_opened_at: Option<String>,
+}
+
+/// Where the agent is, and where its data lives.
+///
+/// Both come from `fury_platform::dirs`, which the agent also calls. That is
+/// not tidiness: the shell and the agent find each other by computing the same
+/// address from the same inputs and there is no discovery step, so a copy of
+/// this logic in each program is a copy that can drift into a shell reporting
+/// "the agent is not running" against an agent that is.
+///
+/// It had already drifted. This file's copy had no Windows branch at all.
+pub use fury_platform::dirs::ipc_endpoint;
+#[cfg(test)]
+use fury_platform::dirs::{data_dir, short_tag};
+
+/// How long to wait for the agent's answer to one method.
+///
+/// Thirty seconds is right for everything that only reads or writes the local
+/// database, and it was applied to launching too. A team profile's launch pulls
+/// its bundle from the server first, which the agent allows five minutes for
+/// (sync.rs: "a bundle is tens of megabytes"), then asks where the proxy exits
+/// (fifteen seconds). A launch that took thirty-one seconds came back as "the
+/// agent did not answer" while the agent went on working, and the profile sat
+/// "in use here" with no browser. A tester's colleague met exactly that on his
+/// first team launch, 27.09.2026. The wait now outlasts the agent's own bounds,
+/// so an answer, or the agent's own error, always arrives.
+fn answer_within(method: &str) -> Duration {
+    match method {
+        "profile.launch" => Duration::from_secs(360),
+        // Stopping a team profile uploads it, under the same five-minute bound
+        // the agent gives the download. Thirty seconds answered "the agent
+        // did not answer" for a large profile on a slow link while the upload
+        // went on.
+        "profile.stop" => Duration::from_secs(360),
+        _ => Duration::from_secs(30),
+    }
+}
+
+/// One request, one response.
+pub async fn call<T: DeserializeOwned>(method: &str, params: Value) -> Result<T, AgentError> {
+    let endpoint = ipc_endpoint();
+    let stream = match fury_platform::Stream::connect(&endpoint).await {
+        Ok(s) => s,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound
+            || e.kind() == std::io::ErrorKind::ConnectionRefused =>
+        {
+            return Err(AgentError::NotRunning)
+        }
+        Err(e) => return Err(AgentError::Io(e)),
+    };
+
+    let (read, mut write) = stream.into_split();
+    let request = serde_json::json!({ "id": 1, "method": method, "params": params });
+    let mut bytes = serde_json::to_vec(&request).map_err(|e| AgentError::Protocol(e.to_string()))?;
+    bytes.push(b'\n');
+    write.write_all(&bytes).await?;
+    write.flush().await?;
+
+    let mut line = String::new();
+    // A bounded wait: a wedged agent must surface as an error the operator can
+    // act on, not as a window that never finishes loading.
+    tokio::time::timeout(
+        answer_within(method),
+        BufReader::new(read).read_line(&mut line),
+    )
+    .await
+    .map_err(|_| AgentError::Protocol("the agent did not answer".into()))??;
+
+    let response: Value =
+        serde_json::from_str(&line).map_err(|e| AgentError::Protocol(e.to_string()))?;
+
+    if let Some(err) = response.get("err").and_then(Value::as_str) {
+        return Err(AgentError::Refused {
+            message: err.to_string(),
+            code: response
+                .get("code")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string),
+        });
+    }
+    let ok = response
+        .get("ok")
+        .ok_or_else(|| AgentError::Protocol("answer had neither ok nor err".into()))?;
+
+    serde_json::from_value(ok.clone()).map_err(|e| AgentError::Protocol(e.to_string()))
+}
+
+/// Starts the agent if nothing answers.
+///
+/// The alternative — telling the operator to open a terminal — would make the
+/// desktop app useless to exactly the people it is for. Spawned detached, so it
+/// keeps holding locks and relays after this window closes, which is the whole
+/// reason it is a separate process.
+pub async fn ensure_running() -> Result<(), AgentError> {
+    if fury_platform::Stream::connect(&ipc_endpoint()).await.is_ok() {
+        if !retire_other_version().await {
+            return Ok(());
+        }
+    }
+    // Mid-update the agent is stopped on purpose, and the binary beside this
+    // one may be the old bundle on its way out. See update::installing.
+    if crate::update::installing() {
+        return Err(AgentError::NotRunning);
+    }
+
+    let binary = agent_binary().ok_or(AgentError::NotRunning)?;
+    let mut cmd = std::process::Command::new(&binary);
+    cmd.arg("serve")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+
+    // Without this Windows draws a console window for the agent, and it sits on
+    // top of the application that just started it: a black box titled with a
+    // path, no content, no obvious way to understand it, and closing it kills
+    // the agent every profile depends on.
+    //
+    // The cause is that fury-agent is a console-subsystem binary -- correct, it
+    // is also a CLI -- and Windows gives a console to any console binary a GUI
+    // process starts unless told otherwise. Redirecting the three standard
+    // streams to null, which this already did, does not prevent the window: the
+    // window is about the subsystem, not about whether anything is written.
+    //
+    // Found by running the built application on a real desktop 16.08.2026.
+    // Nothing over SSH would have shown it, and no test asserts the absence of
+    // a window, so this is the kind of defect only a person looking at a screen
+    // can report.
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        // CREATE_NO_WINDOW. Not DETACHED_PROCESS: the agent must outlive this
+        // window, and on Windows it already does -- a child is not killed when
+        // its parent exits -- so the only thing needed here is to stop the
+        // console appearing.
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        cmd.creation_flags(CREATE_NO_WINDOW);
+    }
+
+    cmd.spawn()?;
+
+    // The socket appears a moment after the process does. Poll rather than
+    // sleep once: on a cold start the database has to be created first.
+    for _ in 0..40 {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        if fury_platform::Stream::connect(&ipc_endpoint()).await.is_ok() {
+            return Ok(());
+        }
+    }
+    Err(AgentError::NotRunning)
+}
+
+/// Whether the agent that answered is another version's, and has been asked
+/// to go so this shell's own can start. Asked once per shell.
+///
+/// An agent outlives the shell that started it, so a new shell can find the
+/// old one still serving: after a crash, a force quit, or an update whose
+/// restart hung (28.10.2026, 0.4.16 -> 0.4.17: the old agent was started again
+/// mid-install from the bundle the updater had moved aside, and the new shell
+/// would have used it). With profiles open it stays: stopping it would drop
+/// their locks and relays, and it is replaced the next time nothing is open.
+async fn retire_other_version() -> bool {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    static CHECKED: AtomicBool = AtomicBool::new(false);
+    if CHECKED.load(Ordering::SeqCst) {
+        return false;
+    }
+    let Ok(status) = call::<Value>("status", serde_json::json!({})).await else {
+        return false;
+    };
+    CHECKED.store(true, Ordering::SeqCst);
+    let theirs = status["version"].as_str().unwrap_or("");
+    let open = status["running"].as_array().map_or(0, Vec::len);
+    if theirs == env!("CARGO_PKG_VERSION") || open > 0 {
+        return false;
+    }
+    eprintln!("agent {theirs} answered a {} shell; asking it to go", env!("CARGO_PKG_VERSION"));
+    if call::<Value>("agent.shutdown", serde_json::json!({})).await.is_err() {
+        return false;
+    }
+    for _ in 0..30 {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        if fury_platform::Stream::connect(&ipc_endpoint()).await.is_err() {
+            return true;
+        }
+    }
+    false
+}
+
+pub(crate) fn agent_binary() -> Option<PathBuf> {
+    if let Ok(explicit) = std::env::var("FURY_AGENT") {
+        let path = PathBuf::from(explicit);
+        return path.exists().then_some(path);
+    }
+    // Beside this binary in a packaged app; beside the shell's own build output
+    // in a development tree, which is the same directory either way.
+    let beside = std::env::current_exe()
+        .ok()?
+        .parent()?
+        .join(if cfg!(windows) { "fury-agent.exe" } else { "fury-agent" });
+    beside.exists().then_some(beside)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_address_is_the_one_the_agent_uses() {
+        // Both sides now call the same function, so this asserts the shell has
+        // not grown a second way of computing it — which is what the two
+        // hand-kept copies were, and what this replaced.
+        assert_eq!(
+            ipc_endpoint().to_string(),
+            fury_platform::ipc::endpoint(&short_tag(&data_dir())).to_string()
+        );
+    }
+}

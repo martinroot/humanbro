@@ -1,0 +1,5284 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// Copyright 2026 Bogdan Shapovalov and the Fury authors
+
+//! HTTP handlers.
+//!
+//! Two rules hold everywhere in this module:
+//!
+//! 1. **Every handler resolves permissions before it touches data.** Never from
+//!    a claim in the request, always from the database. The client is told what
+//!    it may do so the UI can hide what it cannot, but that is presentation —
+//!    the decision is made here.
+//!
+//! 2. **A caller who cannot see a project is told it does not exist.** See
+//!    error.rs for why.
+
+use std::sync::Arc;
+
+use axum::extract::{Path, Query, State};
+use axum::http::HeaderMap;
+use axum::routing::{get, post};
+use axum::{Json, Router};
+use fury_shared::api::{
+    AcquireLockResponse, GrantRequest, LockInfo, ProfileSummary, ProjectSummary, ProxySummary,
+};
+use fury_shared::overrides::MachineOverrides;
+use fury_shared::rbac::{effective, LaunchRestrictions, Perm, PermSet};
+use serde::Deserialize;
+use serde_json::json;
+use uuid::Uuid;
+
+use crate::auth::{self, Caller};
+use crate::error::{ApiError, ApiResult};
+use crate::rbac_guard;
+use crate::AppState;
+
+pub fn routes() -> Router<Arc<AppState>> {
+    Router::new()
+        .route("/v1/auth/login", post(login))
+        .route("/v1/auth/logout", post(logout))
+        .route("/v1/auth/login/totp", post(crate::security::login_totp))
+        // Account recovery and owner hand-over: recovery.rs, docs/25.
+        .route("/v1/auth/recover/start", post(crate::recovery::start))
+        .route("/v1/auth/recover/status", post(crate::recovery::poll))
+        .route("/v1/auth/recover/verify", post(crate::recovery::verify))
+        .route("/v1/auth/recover/material", post(crate::recovery::material))
+        .route("/v1/auth/recover/finish", post(crate::recovery::finish))
+        .route("/v1/me/recovery", get(crate::recovery::status).post(crate::recovery::set))
+        .route("/v1/recovery/{id}/cancel", post(crate::recovery::cancel))
+        .route("/v1/org/recovery", get(crate::recovery::org_pending))
+        .route("/v1/org/owner", post(crate::recovery::hand_over))
+        .route("/v1/me/totp", get(crate::security::totp_status).delete(crate::security::totp_disable))
+        .route("/v1/me/totp/setup", post(crate::security::totp_setup))
+        .route("/v1/me/totp/confirm", post(crate::security::totp_confirm))
+        .route("/v1/me/totp/verify", post(crate::security::totp_verify))
+        .route("/v1/org/security", get(crate::security::get_policy).put(crate::security::put_policy))
+        .route("/v1/org/domain-lists", get(list_domain_lists).post(upsert_domain_list))
+        .route("/v1/org/access-roles", get(list_access_roles).post(upsert_access_role))
+        .route("/v1/org/access-roles/{id}", axum::routing::delete(delete_access_role))
+        .route("/v1/org/personas", get(list_org_personas).post(add_org_persona))
+        .route("/v1/org/personas/{id}", axum::routing::delete(delete_org_persona))
+        .route("/v1/org/domain-lists/{id}", axum::routing::delete(delete_domain_list))
+        .route("/v1/audit/logins", get(crate::security::list_logins))
+        .route("/v1/sessions", get(crate::security::list_sessions))
+        .route("/v1/sessions/{id}", axum::routing::delete(crate::security::revoke_session))
+        .route("/v1/org/members/{user_id}/sessions", axum::routing::delete(crate::security::revoke_member_sessions))
+        .route("/v1/auth/enroll", post(complete_enrollment))
+        .route("/v1/auth/enroll/{code}", get(peek_enrollment))
+        .route("/v1/auth/enroll/{code}/email", post(enroll_email_send))
+        .route("/v1/auth/enroll/{code}/email/verify", post(enroll_email_verify))
+        .route("/v1/auth/signup", post(signup))
+        .route("/v1/server", get(server_info))
+        .route("/v1/me", get(whoami))
+        .route("/v1/projects", get(list_projects).post(create_project))
+        .route(
+            "/v1/projects/{project_id}",
+            axum::routing::patch(rename_project).delete(delete_project),
+        )
+        .route(
+            "/v1/projects/{project_id}/grants",
+            get(list_grants).post(grant_access),
+        )
+        .route(
+            "/v1/projects/{project_id}/grants/{user_id}",
+            axum::routing::delete(revoke_access),
+        )
+        .route("/v1/profiles", get(list_all_profiles))
+        // Handing one profile to one person, across organisations. See
+        // shares.rs and migration 0008 for what that widens and what it costs.
+        .route("/v1/users/lookup", get(crate::shares::lookup_user))
+        .route("/v1/profiles/shared-with-me", get(crate::shares::shared_with_me))
+        .route(
+            "/v1/profiles/{profile_id}/share-material",
+            get(crate::shares::share_material),
+        )
+        .route(
+            "/v1/profiles/{profile_id}/shares",
+            get(crate::shares::list_shares).post(crate::shares::share_profile),
+        )
+        .route(
+            "/v1/profiles/{profile_id}/shares/{user_id}",
+            axum::routing::delete(crate::shares::revoke_share),
+        )
+        .route("/v1/profiles/move", post(move_profiles))
+        .route("/v1/profiles/{profile_id}/clone", post(clone_profile))
+        .route("/v1/profiles/trash", get(list_trash))
+        .route("/v1/profiles/{profile_id}/restore", post(restore_profile))
+        .route("/v1/profiles/{profile_id}/purge", axum::routing::delete(purge_profile))
+        .route("/v1/audit", get(list_audit))
+        .route("/v1/proxies", get(list_proxies).post(create_proxy))
+        .route(
+            "/v1/proxies/{proxy_id}",
+            axum::routing::patch(edit_proxy).delete(delete_proxy),
+        )
+        .route("/v1/proxies/{proxy_id}/credentials", get(reveal_proxy))
+        .route(
+            "/v1/profiles/{profile_id}",
+            axum::routing::patch(edit_profile).delete(delete_profile),
+        )
+        .route(
+            "/v1/projects/{project_id}/profiles",
+            get(list_profiles).post(create_profile),
+        )
+        .route("/v1/org/members", get(list_members))
+        .route("/v1/org/invitations", post(create_invitation))
+        .route("/v1/org/members/{user_id}/key", post(hand_over_key))
+        .route("/v1/org/members/{user_id}/role", post(set_member_role))
+        .route("/v1/org/rotation", get(rotation_material).post(rotate_org_key))
+        .route(
+            "/v1/profiles/{profile_id}/credentials",
+            get(list_credentials).post(create_credential),
+        )
+        .route(
+            "/v1/profiles/{profile_id}/credentials/{credential_id}",
+            axum::routing::patch(edit_credential).delete(delete_credential),
+        )
+        .route("/v1/profiles/{profile_id}/lock", post(acquire_lock))
+        .route("/v1/profiles/{profile_id}/lock/heartbeat", post(heartbeat))
+        .route("/v1/profiles/{profile_id}/unlock", post(release_lock))
+        .route(
+            "/v1/profiles/{profile_id}/bundle",
+            post(upload_bundle).get(download_bundle),
+        )
+}
+
+// ---------------------------------------------------------------------------
+// auth
+// ---------------------------------------------------------------------------
+
+#[derive(Deserialize)]
+pub struct LoginRequest {
+    email: String,
+    password: String,
+    #[serde(default)]
+    machine_name: String,
+    /// The installation's own id (settings.rs mints it once). What "a new
+    /// device" is measured against; absent means every sign-in is new.
+    #[serde(default)]
+    machine_id: Option<String>,
+}
+
+async fn login(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Json(req): Json<LoginRequest>,
+) -> ApiResult<Json<serde_json::Value>> {
+    use crate::security::{self, Attempt};
+    let ip = security::client_ip(&headers);
+    let ua = security::user_agent(&headers);
+    let attempt = |org, user, outcome: &'static str| Attempt {
+        org,
+        user,
+        email: &req.email,
+        outcome,
+        ip,
+        machine_name: &req.machine_name,
+        machine_id: req.machine_id.as_deref(),
+        user_agent: ua.as_deref(),
+    };
+
+    let row: Option<(Uuid, String, Option<Vec<u8>>)> = sqlx::query_as(
+        "SELECT id, password_hash, totp_secret FROM users WHERE email = $1 AND disabled_at IS NULL",
+    )
+    .bind(&req.email)
+    .fetch_optional(&state.db)
+    .await?;
+
+    // One failure mode for "no such user" and "wrong password", or the endpoint
+    // becomes a way to discover who has an account.
+    let Some((user_id, stored, totp_secret)) = row else {
+        // Still spend the time an Argon2 verification would take. Returning
+        // instantly for unknown addresses is a timing oracle over the user list.
+        let _ = auth::verify_password(&req.password, "$argon2id$v=19$m=19456,t=2,p=1$c2FsdHNhbHQ$0000000000000000000000000000000000000000000");
+        security::record_login(&state.db, attempt(None, None, "bad_password")).await;
+        return Err(ApiError::Unauthenticated);
+    };
+
+    // The organisation's policy applies before the password is checked: an
+    // address the list refuses learns nothing about whether the password was
+    // right, and the journal says what happened.
+    let org: Option<(Uuid, String)> = sqlx::query_as(
+        "SELECT org_id, role::text FROM org_members WHERE user_id = $1 LIMIT 1",
+    )
+    .bind(user_id)
+    .fetch_optional(&state.db)
+    .await?;
+    let org_id = org.as_ref().map(|(o, _)| *o);
+    let role = org.as_ref().and_then(|(_, r)| auth::parse_role(r)).unwrap_or(fury_shared::rbac::OrgRole::Member);
+    let policy = match org_id {
+        Some(o) => {
+            let mut conn = state.db.acquire().await?;
+            security::policy_of(&mut conn, o).await?
+        }
+        None => security::Policy::default(),
+    };
+    if !policy.admits(ip, role) {
+        security::record_login(&state.db, attempt(org_id, Some(user_id), "ip_refused")).await;
+        if let Some(o) = org_id {
+            security::audit_login_event(&state.db, o, user_id, "login.ip_refused", json!({
+                "ip": ip.map(|i| i.to_string()), "machine_name": req.machine_name
+            })).await;
+        }
+        return Err(ApiError::Refused("ip_not_allowed"));
+    }
+
+    if !auth::verify_password(&req.password, &stored) {
+        security::record_login(&state.db, attempt(org_id, Some(user_id), "bad_password")).await;
+        // Three in a quarter hour is somebody guessing. No mail is sent from
+        // this server; the audit screen is where the owner sees it.
+        if let Some(o) = org_id {
+            if security::failure_burst(&state.db, user_id, &req.email).await {
+                security::audit_login_event(&state.db, o, user_id, "login.failed_burst", json!({
+                    "ip": ip.map(|i| i.to_string()), "machine_name": req.machine_name
+                })).await;
+            }
+        }
+        return Err(ApiError::Unauthenticated);
+    }
+
+    let enrolled = totp_secret.is_some()
+        && sqlx::query_as::<_, (bool,)>("SELECT totp_enabled_at IS NOT NULL FROM users WHERE id = $1")
+            .bind(user_id)
+            .fetch_one(&state.db)
+            .await
+            .map(|(b,)| b)
+            .unwrap_or(false);
+    let known = security::known_device(&state.db, user_id, req.machine_id.as_deref()).await;
+
+    if security::second_factor_required(&policy, enrolled, known) {
+        let challenge = security::open_challenge(&state.db, user_id, ip, &req.machine_name, req.machine_id.as_deref(), ua.as_deref()).await?;
+        security::record_login(&state.db, attempt(org_id, Some(user_id), "totp_required")).await;
+        // Not a session: a client holding this can do one thing, which is to
+        // present a code within five minutes.
+        return Ok(Json(json!({ "second_factor": "totp", "challenge": challenge })));
+    }
+
+    let body = issue_session(&state, user_id, &req.machine_name, req.machine_id.as_deref(), ip, ua.as_deref()).await?;
+    security::record_login(&state.db, attempt(org_id, Some(user_id), "ok")).await;
+    if let (Some(o), false) = (org_id, known) {
+        security::audit_login_event(&state.db, o, user_id, "login.new_device", json!({
+            "machine_name": req.machine_name, "ip": ip.map(|i| i.to_string()), "second_factor": false
+        })).await;
+    }
+    let mut body = body;
+    // The organisation wants a second factor and this user has none yet: the
+    // sign-in succeeds — locking people out on the day the policy changes is
+    // how policies get turned off — and the client is told to lead them to
+    // enrolment. The owner's screen shows who has not enrolled.
+    if policy.second_factor != "off" && !enrolled {
+        body["must_enrol_totp"] = json!(true);
+    }
+    Ok(Json(body))
+}
+
+/// A session for a user who has proven who they are — by password, or by
+/// password and code. Shared by `login` and `security::login_totp` so the two
+/// halves of a sign-in cannot drift apart in what they hand back.
+pub(crate) async fn issue_session(
+    state: &AppState,
+    user_id: Uuid,
+    machine_name: &str,
+    machine_id: Option<&str>,
+    ip: Option<std::net::IpAddr>,
+    user_agent: Option<&str>,
+) -> ApiResult<serde_json::Value> {
+    let (wrapped_private_key, kdf_salt): (Vec<u8>, Vec<u8>) =
+        sqlx::query_as("SELECT wrapped_private_key, kdf_salt FROM users WHERE id = $1")
+            .bind(user_id)
+            .fetch_one(&state.db)
+            .await?;
+
+    let (raw, digest) = auth::new_token();
+    sqlx::query(
+        "INSERT INTO sessions (token_hash, user_id, expires_at, machine_name, machine_id, ip, user_agent) \
+         VALUES ($1, $2, now() + ($3 || ' hours')::interval, $4, $5, $6::inet, $7)",
+    )
+    .bind(&digest)
+    .bind(user_id)
+    .bind(auth::SESSION_TTL_HOURS.to_string())
+    .bind(machine_name)
+    .bind(machine_id)
+    .bind(ip.map(|i| i.to_string()))
+    .bind(user_agent)
+    .execute(&state.db)
+    .await?;
+
+    // The wrapped keys travel with the session, because the client needs them
+    // on every machine and holding them locally would mean a second place they
+    // can be lost. They are useless to anyone who intercepts them: the private
+    // key opens only under a key derived from the password, and the ORK opens
+    // only under the private key.
+    let org: Option<(Uuid, Option<Vec<u8>>, String, Option<i32>)> = sqlx::query_as(
+        "SELECT org_id, wrapped_ork, role::text, ork_generation \
+         FROM org_members WHERE user_id = $1 LIMIT 1",
+    )
+    .bind(user_id)
+    .fetch_optional(&state.db)
+    .await?;
+
+    use base64::Engine;
+    let b64 = |v: &[u8]| base64::engine::general_purpose::STANDARD.encode(v);
+
+    Ok(json!({
+        "token": raw,
+        "user_id": user_id,
+        "wrapped_private_key": b64(&wrapped_private_key),
+        "kdf_salt": b64(&kdf_salt),
+        "org_id": org.as_ref().map(|(id, _, _, _)| *id),
+        "role": org.as_ref().map(|(_, _, r, _)| r.clone()),
+        // None means enrolled but not yet handed the organisation key: they can
+        // sign in and see the shape of the team, and decrypt nothing.
+        "wrapped_ork": org.as_ref().and_then(|(_, ork, _, _)| ork.as_deref()).map(b64),
+        // Which generation this wrapping belongs to.
+        //
+        // Without it a client cannot tell a current key from a retired one, and
+        // the wrapping carries no signature — `seal_to` is anonymous by design.
+        // A server that kept a member's pre-rotation blob could serve it back
+        // and quietly return them to a key somebody else still holds. The
+        // client refuses anything below the highest generation it has seen.
+        "ork_generation": org.as_ref().and_then(|(_, _, _, g)| *g),
+    }))
+}
+
+// ---------------------------------------------------------------------------
+// enrolment
+// ---------------------------------------------------------------------------
+
+/// An invitation as stored. `org_id` and `org_name` are exclusive: one joins an
+/// existing organisation, the other creates it — see the check constraint in
+/// migration 0003.
+#[derive(sqlx::FromRow)]
+struct Invitation {
+    id: Uuid,
+    email: String,
+    org_name: Option<String>,
+    org_id: Option<Uuid>,
+    role: String,
+}
+
+/// What an invitation is for, before anyone commits to it.
+///
+/// Shown so the person typing a code sees "you are joining My team as owner"
+/// rather than a password field and a hope. It reveals the invited address to
+/// whoever holds the code — who already holds the code, and could simply use
+/// it.
+/// What a launcher can learn before anyone signs in.
+///
+/// One unauthenticated fact: whether this server lets a stranger make an
+/// account. The launcher needs it to decide whether to offer the button, and
+/// offering a button that always fails is its own kind of lie.
+///
+/// Deliberately nothing else. A server's name, its size, who is on it — all of
+/// that would turn an address into a thing worth scanning for.
+async fn server_info(State(state): State<Arc<AppState>>) -> Json<serde_json::Value> {
+    // And whether an invited address is confirmed by email: the person
+    // sending a code is told whether the code alone is enough (mail.rs).
+    Json(json!({ "open_signup": state.open_signup, "email_check": state.mailer.is_some() }))
+}
+
+/// Whether redeeming this invitation takes the six digits from the letter.
+/// Not for an owner's bootstrap code: it is minted at the server's own shell,
+/// by the person it is for.
+fn email_check_applies(state: &AppState, role: &str) -> bool {
+    state.mailer.is_some() && role != "owner"
+}
+
+/// How long the six digits live, how many letters one invitation may send,
+/// how far apart, and how many wrong answers spend a letter's code.
+const EMAIL_CODE_MINUTES: i64 = 15;
+const EMAIL_LETTERS_MAX: i32 = 5;
+const EMAIL_LETTER_GAP_SECS: i64 = 60;
+const EMAIL_ATTEMPTS_MAX: i32 = 5;
+
+/// The stored form of the six digits or of the proof: bound to the invitation
+/// so a hash from one row says nothing about another.
+fn email_secret_hash(enrollment: Uuid, secret: &str) -> Vec<u8> {
+    use sha2::{Digest, Sha256};
+    Sha256::digest(format!("{enrollment}:{secret}").as_bytes()).to_vec()
+}
+
+#[derive(Deserialize)]
+struct EmailCodeRequest {
+    /// The language of the newcomer's app, for the letter.
+    #[serde(default)]
+    lang: String,
+}
+
+/// `POST /v1/auth/enroll/{code}/email` -- send six digits to the invited
+/// address. A minute apart and five per invitation, so a code in the wrong
+/// hands cannot be used to flood somebody's inbox.
+async fn enroll_email_send(
+    State(state): State<Arc<AppState>>,
+    Path(code): Path<String>,
+    Json(req): Json<EmailCodeRequest>,
+) -> ApiResult<Json<serde_json::Value>> {
+    let Some(mailer) = state.mailer.clone() else {
+        return Err(ApiError::BadRequest("this server does not confirm addresses by email".into()));
+    };
+    let mut tx = state.db.begin().await?;
+    let row: Option<(Uuid, String, Option<String>, Option<Uuid>, String, i32, i64)> = sqlx::query_as(
+        "SELECT id, email::text, org_name, org_id, role::text, email_codes_sent, \
+                CASE WHEN email_code_sent_at IS NULL THEN 0 \
+                     ELSE GREATEST(0, CEIL($2 - EXTRACT(EPOCH FROM now() - email_code_sent_at))) END::bigint \
+         FROM enrollments \
+         WHERE code_hash = $1 AND used_at IS NULL AND expires_at > now() \
+         FOR UPDATE",
+    )
+    .bind(crate::enroll::hash_code(&code))
+    .bind(EMAIL_LETTER_GAP_SECS as f64)
+    .fetch_optional(&mut *tx)
+    .await?;
+    // The same one answer for expired, spent and unknown as the peek gives.
+    let Some((id, email, org_name, org_id, role, sent, wait)) = row else {
+        return Err(ApiError::NotFound);
+    };
+    if !email_check_applies(&state, &role) {
+        return Err(ApiError::BadRequest("this invitation is not confirmed by email".into()));
+    }
+    if wait > 0 {
+        return Ok(Json(json!({ "sent": false, "retry_after": wait })));
+    }
+    if sent >= EMAIL_LETTERS_MAX {
+        return Err(ApiError::BadRequest(
+            "five letters have been sent for this invitation already; ask whoever invited you for a new one".into(),
+        ));
+    }
+
+    let digits = {
+        use rand::Rng;
+        format!("{:06}", rand::rngs::OsRng.gen_range(0..1_000_000u32))
+    };
+    sqlx::query(
+        "UPDATE enrollments SET email_code_hash = $2, \
+                email_code_expires_at = now() + ($3 || ' minutes')::interval, \
+                email_code_attempts = 0, email_code_sent_at = now(), \
+                email_codes_sent = email_codes_sent + 1, email_proof_hash = NULL \
+         WHERE id = $1",
+    )
+    .bind(id)
+    .bind(email_secret_hash(id, &digits))
+    .bind(EMAIL_CODE_MINUTES.to_string())
+    .execute(&mut *tx)
+    .await?;
+
+    let org = match (org_name, org_id) {
+        (Some(name), _) => name,
+        (None, Some(org)) => sqlx::query_scalar::<_, String>("SELECT name FROM organizations WHERE id = $1")
+            .bind(org)
+            .fetch_one(&mut *tx)
+            .await?,
+        (None, None) => String::new(),
+    };
+    // Sent before the commit: a letter that did not go out must not use up one
+    // of the five, or the minute's wait.
+    let (subject, body) = crate::mail::email_code_letter(&req.lang, &org, &digits, EMAIL_CODE_MINUTES);
+    if let Err(e) = mailer.send(&email, &subject, body).await {
+        tracing::warn!(error = %e, "could not send an invitation's email code");
+        return Err(ApiError::BadRequest(
+            "the server could not send the letter; try again in a minute, or tell whoever invited you".into(),
+        ));
+    }
+    tx.commit().await?;
+    Ok(Json(json!({ "sent": true, "retry_after": EMAIL_LETTER_GAP_SECS })))
+}
+
+#[derive(Deserialize)]
+struct EmailVerifyRequest {
+    email_code: String,
+}
+
+/// `POST /v1/auth/enroll/{code}/email/verify` -- the six digits in, a one-time
+/// proof out, which `complete_enrollment` then requires. Checked here, before
+/// a password is chosen, so a mistyped code is not found out after the keys
+/// were generated.
+async fn enroll_email_verify(
+    State(state): State<Arc<AppState>>,
+    Path(code): Path<String>,
+    Json(req): Json<EmailVerifyRequest>,
+) -> ApiResult<Json<serde_json::Value>> {
+    let mut tx = state.db.begin().await?;
+    let row: Option<(Uuid, Option<Vec<u8>>, bool, i32)> = sqlx::query_as(
+        "SELECT id, email_code_hash, COALESCE(email_code_expires_at > now(), false), email_code_attempts \
+         FROM enrollments \
+         WHERE code_hash = $1 AND used_at IS NULL AND expires_at > now() \
+         FOR UPDATE",
+    )
+    .bind(crate::enroll::hash_code(&code))
+    .fetch_optional(&mut *tx)
+    .await?;
+    let Some((id, stored, live, attempts)) = row else {
+        return Err(ApiError::NotFound);
+    };
+    let Some(stored) = stored.filter(|_| live) else {
+        return Err(ApiError::BadRequest("the code from the letter has expired; send another letter".into()));
+    };
+    if attempts >= EMAIL_ATTEMPTS_MAX {
+        return Err(ApiError::BadRequest("too many wrong codes; send another letter".into()));
+    }
+    let digits: String = req.email_code.chars().filter(|c| c.is_ascii_digit()).collect();
+    if email_secret_hash(id, &digits) != stored {
+        sqlx::query("UPDATE enrollments SET email_code_attempts = email_code_attempts + 1 WHERE id = $1")
+            .bind(id)
+            .execute(&mut *tx)
+            .await?;
+        tx.commit().await?;
+        return Err(ApiError::BadRequest("that is not the code from the letter".into()));
+    }
+    let proof = {
+        use rand::RngCore;
+        let mut b = [0u8; 32];
+        rand::rngs::OsRng.fill_bytes(&mut b);
+        b.iter().map(|x| format!("{x:02x}")).collect::<String>()
+    };
+    // The digits are spent: the proof is what carries the confirmation on.
+    sqlx::query("UPDATE enrollments SET email_proof_hash = $2, email_code_hash = NULL WHERE id = $1")
+        .bind(id)
+        .bind(email_secret_hash(id, &proof))
+        .execute(&mut *tx)
+        .await?;
+    tx.commit().await?;
+    Ok(Json(json!({ "email_proof": proof })))
+}
+
+#[derive(Deserialize)]
+pub struct SignupRequest {
+    email: String,
+    password: String,
+    /// What to call the organisation this creates. Theirs alone.
+    org_name: String,
+    /// base64, as in enrolment. The server never parses these beyond decoding.
+    public_key: String,
+    wrapped_private_key: String,
+    kdf_salt: String,
+    /// Required: a sign-up always creates an organisation, so it always creates
+    /// an owner, and an owner without the wrapped key owns nothing openable.
+    wrapped_ork: String,
+    #[serde(default)]
+    machine_name: String,
+}
+
+/// Make an account with no invitation.
+///
+/// The only way onto a server used to be a code issued from its shell, which is
+/// right for a team someone runs and wrong for a product someone downloads: a
+/// person who installs Fury and wants their profiles on a server had nowhere to
+/// go. This is that path.
+///
+/// Every sign-up creates its OWN organisation, with the caller as owner. That is
+/// the whole safety story and it is structural rather than a check: an
+/// organisation is the boundary every query already filters on, so a stranger
+/// who signs up on your server cannot address anything of yours. They cost you
+/// rows and nothing else.
+async fn signup(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<SignupRequest>,
+) -> ApiResult<Json<serde_json::Value>> {
+    if !state.open_signup {
+        return Err(ApiError::BadRequest(
+            "this server does not take open sign-ups. Ask whoever runs it for an \
+             invitation, or set FURY_OPEN_SIGNUP=1 if it is yours"
+                .into(),
+        ));
+    }
+
+    // The ceiling on a shared server, checked before anything is written.
+    //
+    // Deleted organisations still count. An organisation is soft-deleted so its
+    // profiles survive a mistake, and letting a delete-and-recreate loop past
+    // the limit would make the limit decorative.
+    if let Some(max) = state.limits.max_orgs {
+        let existing: i64 = sqlx::query_scalar("SELECT count(*) FROM organizations")
+            .fetch_one(&state.db)
+            .await?;
+        if existing >= max {
+            return Err(ApiError::BadRequest(format!(
+                "this server is full: it accepts {max} organisations and has {existing}. \
+                 Ask whoever runs it for an invitation to an existing one"
+            )));
+        }
+    }
+
+    use base64::Engine;
+    let b64 = |what: &str, v: &str| -> Result<Vec<u8>, ApiError> {
+        base64::engine::general_purpose::STANDARD
+            .decode(v)
+            .map_err(|_| ApiError::BadRequest(format!("{what} is not base64")))
+    };
+    let public_key = b64("public_key", &req.public_key)?;
+    let wrapped_private_key = b64("wrapped_private_key", &req.wrapped_private_key)?;
+    let kdf_salt = b64("kdf_salt", &req.kdf_salt)?;
+    let wrapped_ork = b64("wrapped_ork", &req.wrapped_ork)?;
+
+    let email = req.email.trim().to_ascii_lowercase();
+    if !email.contains('@') || email.len() < 3 {
+        return Err(ApiError::BadRequest("that is not an email address".into()));
+    }
+    let org_name = req.org_name.trim();
+    if org_name.is_empty() {
+        return Err(ApiError::BadRequest("the organisation needs a name".into()));
+    }
+    // Same rule and the same sentence as enrolment: one requirement, said once.
+    if req.password.len() < 12 {
+        return Err(ApiError::BadRequest(
+            "the password must be at least 12 characters: it is the only thing standing \
+             between a stolen laptop and this organisation's accounts"
+                .into(),
+        ));
+    }
+    if public_key.len() != 32 {
+        return Err(ApiError::BadRequest(
+            "public_key must be 32 bytes — X25519".into(),
+        ));
+    }
+
+    // One transaction: a user without an organisation cannot sign in and cannot
+    // be repaired from the outside.
+    let mut tx = state.db.begin().await?;
+
+    let user_id = Uuid::now_v7();
+    let password_hash = auth::hash_password(&req.password)
+        .map_err(|e| ApiError::Internal(anyhow::anyhow!("{e}")))?;
+
+    sqlx::query(
+        "INSERT INTO users (id, email, password_hash, public_key, wrapped_private_key, kdf_salt) \
+         VALUES ($1, $2, $3, $4, $5, $6)",
+    )
+    .bind(user_id)
+    .bind(&email)
+    .bind(&password_hash)
+    .bind(&public_key)
+    .bind(&wrapped_private_key)
+    .bind(&kdf_salt)
+    .execute(&mut *tx)
+    .await
+    .map_err(|e| match &e {
+        sqlx::Error::Database(db) if db.is_unique_violation() => ApiError::BadRequest(
+            "that address already has an account on this server. Sign in instead".into(),
+        ),
+        _ => ApiError::Db(e),
+    })?;
+
+    let org_id = Uuid::now_v7();
+    sqlx::query("INSERT INTO organizations (id, name) VALUES ($1, $2)")
+        .bind(org_id)
+        .bind(org_name)
+        .execute(&mut *tx)
+        .await?;
+
+    sqlx::query(
+        "INSERT INTO org_members (org_id, user_id, role, wrapped_ork, ork_generation) \
+         VALUES ($1, $2, 'owner'::org_role, $3, 1)",
+    )
+    .bind(org_id)
+    .bind(user_id)
+    .bind(&wrapped_ork)
+    .execute(&mut *tx)
+    .await?;
+
+    // Signed in on the way out, as enrolment does. Asking someone to retype the
+    // password they chose ten seconds ago, into the same window, teaches them
+    // nothing.
+    let (raw, digest) = auth::new_token();
+    sqlx::query(
+        "INSERT INTO sessions (token_hash, user_id, expires_at, machine_name) \
+         VALUES ($1, $2, now() + ($3 || ' hours')::interval, $4)",
+    )
+    .bind(&digest)
+    .bind(user_id)
+    .bind(auth::SESSION_TTL_HOURS.to_string())
+    .bind(&req.machine_name)
+    .execute(&mut *tx)
+    .await?;
+
+    tx.commit().await?;
+
+    tracing::info!(%user_id, %org_id, "signed up");
+    Ok(Json(json!({
+        "token": raw,
+        "user_id": user_id,
+        "org_id": org_id,
+        "role": "owner",
+        "has_org_key": true,
+    })))
+}
+
+async fn peek_enrollment(
+    State(state): State<Arc<AppState>>,
+    Path(code): Path<String>,
+) -> ApiResult<Json<serde_json::Value>> {
+    let row: Option<Invitation> = sqlx::query_as(
+        "SELECT id, email, org_name, org_id, role::text AS role \
+         FROM enrollments \
+         WHERE code_hash = $1 AND used_at IS NULL AND expires_at > now()",
+    )
+    .bind(crate::enroll::hash_code(&code))
+    .fetch_optional(&state.db)
+    .await?;
+
+    // Expired, spent and never-existed are one answer. Distinguishing them
+    // turns this endpoint into a way to test codes.
+    let Some(inv) = row else {
+        return Err(ApiError::NotFound);
+    };
+    let Invitation { email, org_name, org_id, role, .. } = inv;
+
+    let org = match (org_name, org_id) {
+        (Some(name), _) => name,
+        (None, Some(id)) => {
+            sqlx::query_scalar::<_, String>("SELECT name FROM organizations WHERE id = $1")
+                .bind(id)
+                .fetch_one(&state.db)
+                .await?
+        }
+        (None, None) => return Err(ApiError::NotFound),
+    };
+
+    Ok(Json(json!({
+        "email": email,
+        "organization": org,
+        "role": role,
+        // An owner brings the organisation key into being; everyone else waits
+        // to be handed it. The client needs to know which job it has.
+        "creates_org_key": role == "owner",
+        // Whether the next step is the six digits from a letter (mail.rs).
+        "email_check": email_check_applies(&state, &role),
+    })))
+}
+
+/// Everything the client generated, in one request.
+///
+/// The server checks the code and stores the material. It cannot read any of
+/// it: `wrapped_private_key` is sealed under a key derived from the password on
+/// the client, and `wrapped_ork` is sealed to the public key. What arrives here
+/// as `password` is used for one thing — the Argon2id login hash — and is not
+/// the input to either wrapping, which uses a separate salt the client keeps.
+#[derive(Deserialize)]
+pub struct EnrollRequest {
+    code: String,
+    password: String,
+    /// base64, all of them. The server never parses these beyond decoding.
+    public_key: String,
+    wrapped_private_key: String,
+    kdf_salt: String,
+    /// Present when the invitation creates the organisation, absent otherwise.
+    #[serde(default)]
+    wrapped_ork: Option<String>,
+    #[serde(default)]
+    machine_name: String,
+    /// What `enroll_email_verify` returned, when the server confirms addresses.
+    #[serde(default)]
+    email_proof: Option<String>,
+}
+
+async fn complete_enrollment(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<EnrollRequest>,
+) -> ApiResult<Json<serde_json::Value>> {
+    use base64::Engine;
+    let b64 = |what: &str, v: &str| -> Result<Vec<u8>, ApiError> {
+        base64::engine::general_purpose::STANDARD
+            .decode(v)
+            .map_err(|_| ApiError::BadRequest(format!("{what} is not base64")))
+    };
+
+    let public_key = b64("public_key", &req.public_key)?;
+    let wrapped_private_key = b64("wrapped_private_key", &req.wrapped_private_key)?;
+    let kdf_salt = b64("kdf_salt", &req.kdf_salt)?;
+    let wrapped_ork = req
+        .wrapped_ork
+        .as_deref()
+        .map(|v| b64("wrapped_ork", v))
+        .transpose()?;
+
+    // X25519. A key of the wrong length would be stored happily and fail years
+    // later, when someone tries to wrap the ORK to it.
+    if public_key.len() != 32 {
+        return Err(ApiError::BadRequest(
+            "public_key must be 32 bytes — X25519".into(),
+        ));
+    }
+    if req.password.len() < 12 {
+        return Err(ApiError::BadRequest(
+            "the password must be at least 12 characters: it is the only thing standing \
+             between a stolen laptop and this organisation's accounts"
+                .into(),
+        ));
+    }
+
+    // One transaction from here: a half-enrolled owner is an organisation
+    // nobody can enter and the code cannot be spent again to fix it.
+    let mut tx = state.db.begin().await?;
+
+    let row: Option<Invitation> = sqlx::query_as(
+        "SELECT id, email, org_name, org_id, role::text AS role FROM enrollments \
+         WHERE code_hash = $1 AND used_at IS NULL AND expires_at > now() \
+         FOR UPDATE",
+    )
+    .bind(crate::enroll::hash_code(&req.code))
+    .fetch_optional(&mut *tx)
+    .await?;
+
+    let Some(Invitation { id: enrollment_id, email, org_name, org_id, role }) = row else {
+        return Err(ApiError::BadRequest(
+            "this invitation is not valid — it may have been used already, or expired".into(),
+        ));
+    };
+
+    if email_check_applies(&state, &role) {
+        let stored: Option<Vec<u8>> =
+            sqlx::query_scalar("SELECT email_proof_hash FROM enrollments WHERE id = $1")
+                .bind(enrollment_id)
+                .fetch_one(&mut *tx)
+                .await?;
+        let proven = match (stored, req.email_proof.as_deref()) {
+            (Some(stored), Some(proof)) => email_secret_hash(enrollment_id, proof) == stored,
+            _ => false,
+        };
+        if !proven {
+            return Err(ApiError::BadRequest(
+                "this server confirms the invited address by email first. If the app did not ask for \
+                 a code from a letter, update Fury to 0.3.12 or later"
+                    .into(),
+            ));
+        }
+    }
+
+    let owner = role == "owner";
+    if owner && wrapped_ork.is_none() {
+        return Err(ApiError::BadRequest(
+            "an owner enrolment must carry the wrapped organisation key".into(),
+        ));
+    }
+
+    // An organisation is created at the moment it acquires an owner, never
+    // before: a bootstrap abandoned halfway leaves nothing behind.
+    let org_id = match (org_id, org_name) {
+        (Some(id), _) => id,
+        (None, Some(name)) => {
+            let id = Uuid::now_v7();
+            sqlx::query("INSERT INTO organizations (id, name) VALUES ($1, $2)")
+                .bind(id)
+                .bind(&name)
+                .execute(&mut *tx)
+                .await?;
+            id
+        }
+        (None, None) => return Err(ApiError::Internal(anyhow::anyhow!("enrolment targets no org"))),
+    };
+
+    let user_id = Uuid::now_v7();
+    let password_hash = auth::hash_password(&req.password)
+        .map_err(|e| ApiError::Internal(anyhow::anyhow!("{e}")))?;
+
+    sqlx::query(
+        "INSERT INTO users (id, email, password_hash, public_key, wrapped_private_key, kdf_salt) \
+         VALUES ($1, $2, $3, $4, $5, $6)",
+    )
+    .bind(user_id)
+    .bind(&email)
+    .bind(&password_hash)
+    .bind(&public_key)
+    .bind(&wrapped_private_key)
+    .bind(&kdf_salt)
+    .execute(&mut *tx)
+    .await
+    .map_err(|e| match &e {
+        // The address is taken. Saying so is not a leak: whoever holds this
+        // invitation was told the address it was issued for.
+        sqlx::Error::Database(db) if db.is_unique_violation() => {
+            ApiError::BadRequest(format!("{email} already has an account on this server"))
+        }
+        _ => ApiError::Db(e),
+    })?;
+
+    sqlx::query(
+        "INSERT INTO org_members (org_id, user_id, role, wrapped_ork, ork_generation) \
+         VALUES ($1, $2, $3::org_role, $4, $5)",
+    )
+    .bind(org_id)
+    .bind(user_id)
+    .bind(&role)
+    .bind(&wrapped_ork)
+    // A member with no key yet has no generation either — it is set when the
+    // key is handed over, and must record which generation was handed.
+    .bind(wrapped_ork.as_ref().map(|_| 1i32))
+    .execute(&mut *tx)
+    .await?;
+
+    sqlx::query("UPDATE enrollments SET used_at = now() WHERE id = $1")
+        .bind(enrollment_id)
+        .execute(&mut *tx)
+        .await?;
+
+    // Signed in on the way out. Asking someone to type the password they just
+    // chose, into the same window, teaches them nothing.
+    let (raw, digest) = auth::new_token();
+    sqlx::query(
+        "INSERT INTO sessions (token_hash, user_id, expires_at, machine_name) \
+         VALUES ($1, $2, now() + ($3 || ' hours')::interval, $4)",
+    )
+    .bind(&digest)
+    .bind(user_id)
+    .bind(auth::SESSION_TTL_HOURS.to_string())
+    .bind(&req.machine_name)
+    .execute(&mut *tx)
+    .await?;
+
+    tx.commit().await?;
+
+    tracing::info!(%user_id, %org_id, %role, "enrolled");
+    Ok(Json(json!({
+        "token": raw,
+        "user_id": user_id,
+        "org_id": org_id,
+        "role": role,
+        "has_org_key": wrapped_ork.is_some(),
+    })))
+}
+
+/// The address, and whether a wrapped organisation key exists for this member.
+///
+/// The second is not the same question as "are they signed in", and it is the
+/// difference between two screens that used to be one. A member who has
+/// enrolled holds nothing until an owner seals the key to their public key. The
+/// client cannot tell that state from "the key is simply not in this process
+/// yet" — both are "no key here" — so it showed one screen for both: a password
+/// box above a sentence offering both explanations. For the member waiting on
+/// the owner that box can never work, and they typed into it, correctly, and
+/// arrived back at it.
+///
+/// A constant for the same reason `audit_page_sql` is a function: a query that
+/// names a column is a claim about the schema, and the only place that claim
+/// can be checked is a real database.
+pub(crate) const WHOAMI_SQL: &str = "SELECT u.email, EXISTS ( \
+         SELECT 1 FROM org_members m \
+         WHERE m.user_id = u.id AND m.wrapped_ork IS NOT NULL \
+     ) FROM users u WHERE u.id = $1";
+
+/// Who the presented token belongs to.
+///
+/// The login response already carries this, but a client that restarts holds
+/// only a token. Without this endpoint it cannot tell whether a lock is its own
+/// or a colleague's — and "you are already in this profile" versus "take it away
+/// from someone" must never be the same button.
+async fn whoami(
+    State(state): State<Arc<AppState>>,
+    caller: Caller,
+) -> ApiResult<Json<serde_json::Value>> {
+    let (email, has_org_key): (String, bool) = sqlx::query_as(WHOAMI_SQL)
+        .bind(caller.user_id)
+        .fetch_one(&state.db)
+        .await?;
+    Ok(Json(json!({
+        "user_id": caller.user_id,
+        "email": email,
+        "org_id": caller.org_id,
+        "role": caller.role,
+        "has_org_key": has_org_key,
+        // So the application can tell a self-hosting owner their server is
+        // behind the latest release; the tester who runs his own learned of
+        // server updates only when told (14.10.2026). Here and not in
+        // /v1/server: that one answers strangers, and a version is what a
+        // scanner looks for first.
+        "server_version": env!("CARGO_PKG_VERSION"),
+    })))
+}
+
+async fn logout(State(state): State<Arc<AppState>>, caller: Caller) -> ApiResult<Json<serde_json::Value>> {
+    // Every session of this user, not just the presented one: "log me out" from
+    // someone who thinks they were compromised has to mean everywhere.
+    sqlx::query("DELETE FROM sessions WHERE user_id = $1")
+        .bind(caller.user_id)
+        .execute(&state.db)
+        .await?;
+    Ok(Json(json!({ "ok": true })))
+}
+
+// ---------------------------------------------------------------------------
+// projects
+// ---------------------------------------------------------------------------
+
+async fn list_projects(
+    mut db: auth::Db,
+) -> ApiResult<Json<Vec<ProjectSummary>>> {
+    // Copied out so that reading it does not borrow the connection: a
+    // handler needs both in the same expression constantly.
+    let caller = db.caller;
+
+    // Resolved in SQL rather than by filtering in Rust: a project the caller
+    // cannot see must never be loaded, so that a bug in the mapping code cannot
+    // leak one.
+    let rows: Vec<(Uuid, String, String, Option<String>, i64, Option<i64>)> = sqlx::query_as(
+        r#"
+        SELECT p.id, p.name, p.description, p.color,
+               (SELECT count(*) FROM profiles f
+                 WHERE f.project_id = p.id AND f.deleted_at IS NULL),
+               g.permissions
+        FROM projects p
+        JOIN org_members m ON m.org_id = p.org_id AND m.user_id = $1
+        LEFT JOIN project_grants g
+               ON g.project_id = p.id AND g.user_id = $1
+              AND (g.expires_at IS NULL OR g.expires_at > now())
+        WHERE p.deleted_at IS NULL
+          AND ($2 OR g.permissions IS NOT NULL)
+        ORDER BY p.name
+        "#,
+    )
+    .bind(caller.user_id)
+    .bind(fury_shared::rbac::has_implicit_project_access(caller.role))
+    .fetch_all(db.as_mut())
+    .await?;
+
+    Ok(Json(
+        rows.into_iter()
+            .map(|(id, name, description, color, profile_count, grant)| ProjectSummary {
+                id,
+                name,
+                description,
+                color,
+                profile_count,
+                permissions: effective(caller.role, grant.map(PermSet)).to_vec(),
+            })
+            .collect(),
+    ))
+}
+
+#[derive(Deserialize)]
+pub struct ProjectRequest {
+    name: String,
+    #[serde(default)]
+    description: String,
+    #[serde(default)]
+    color: Option<String>,
+}
+
+/// Make a project.
+///
+/// Owners and admins only. A project is the unit access is granted over, so the
+/// right to create one is the right to create a container whose membership you
+/// then decide — which is an administrative act, not an operator's.
+async fn create_project(
+    mut db: auth::Db,
+    Json(req): Json<ProjectRequest>,
+) -> ApiResult<Json<serde_json::Value>> {
+    // Copied out so that reading it does not borrow the connection: a
+    // handler needs both in the same expression constantly.
+    let caller = db.caller;
+
+    use fury_shared::rbac::OrgRole;
+    if !matches!(caller.role, OrgRole::Owner | OrgRole::Admin) {
+        return Err(ApiError::Denied(Perm::ManageAccess));
+    }
+    let name = req.name.trim();
+    if name.is_empty() {
+        return Err(ApiError::BadRequest("a project needs a name".into()));
+    }
+
+    let id = Uuid::now_v7();
+    sqlx::query(
+        "INSERT INTO projects (id, org_id, name, description, color, created_by) \
+         VALUES ($1, $2, $3, $4, $5, $6)",
+    )
+    .bind(id)
+    .bind(caller.org_id)
+    .bind(name)
+    .bind(&req.description)
+    .bind(&req.color)
+    .bind(caller.user_id)
+    .execute(db.as_mut())
+    .await?;
+
+    audit(db.as_mut(), &caller, "project.create", Some(id), json!({ "name": name })).await?;
+    Ok(Json(json!({ "id": id })))
+}
+
+async fn rename_project(
+    mut db: auth::Db,
+    Path(project_id): Path<Uuid>,
+    Json(req): Json<ProjectRequest>,
+) -> ApiResult<Json<serde_json::Value>> {
+    // Copied out so that reading it does not borrow the connection: a
+    // handler needs both in the same expression constantly.
+    let caller = db.caller;
+
+    rbac_guard::require(db.as_mut(), caller.user_id, project_id, Perm::ManageAccess).await?;
+    let name = req.name.trim();
+    if name.is_empty() {
+        return Err(ApiError::BadRequest("a project needs a name".into()));
+    }
+
+    sqlx::query(
+        "UPDATE projects SET name = $1, description = $2, color = $3 \
+         WHERE id = $4 AND org_id = $5 AND deleted_at IS NULL",
+    )
+    .bind(name)
+    .bind(&req.description)
+    .bind(&req.color)
+    .bind(project_id)
+    .bind(caller.org_id)
+    .execute(db.as_mut())
+    .await?;
+
+    audit(db.as_mut(), &caller, "project.rename", Some(project_id), json!({ "name": name })).await?;
+    Ok(Json(json!({ "ok": true })))
+}
+
+/// Soft-delete, with its profiles.
+///
+/// The same rule the local store follows: a project that disappears while its
+/// profiles stay visible somewhere else is a lie, and a project whose deletion
+/// destroys a warmed account outright is a disaster. Both go to the same
+/// deleted state, in one transaction, and both come back together.
+///
+/// Refused while anything inside is open. A profile whose browser is running
+/// will push a bundle when it closes, and pushing into a deleted project is a
+/// write nobody can find afterwards.
+async fn delete_project(
+    mut db: auth::Db,
+    Path(project_id): Path<Uuid>,
+) -> ApiResult<Json<serde_json::Value>> {
+    // Copied out so that reading it does not borrow the connection: a
+    // handler needs both in the same expression constantly.
+    let caller = db.caller;
+
+    use fury_shared::rbac::OrgRole;
+    if !matches!(caller.role, OrgRole::Owner | OrgRole::Admin) {
+        return Err(ApiError::Denied(Perm::ManageAccess));
+    }
+
+    let mut tx = db.begin().await?;
+
+    let open: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM profile_locks l JOIN profiles p ON p.id = l.profile_id \
+         WHERE p.project_id = $1 AND l.expires_at > now()",
+    )
+    .bind(project_id)
+    .fetch_one(&mut *tx)
+    .await?;
+    if open > 0 {
+        return Err(ApiError::Conflict(format!(
+            "{open} profile(s) in this project are open right now. Close them first"
+        )));
+    }
+
+    // rows_affected, not RETURNING. `RETURNING 1` in Postgres is an `integer`,
+    // and this read it as `i64` — so sqlx refused to decode it and the whole
+    // delete failed with a 500, but ONLY for a project that had profiles: an
+    // empty one returns no rows, so nothing is decoded and nothing goes wrong.
+    // "The empty project deletes and the full one does not" is exactly how it
+    // was reported.
+    let profiles = sqlx::query(
+        "UPDATE profiles SET deleted_at = now() \
+         WHERE project_id = $1 AND deleted_at IS NULL",
+    )
+    .bind(project_id)
+    .execute(&mut *tx)
+    .await?
+    .rows_affected() as i64;
+
+    let updated = sqlx::query(
+        "UPDATE projects SET deleted_at = now() \
+         WHERE id = $1 AND org_id = $2 AND deleted_at IS NULL",
+    )
+    .bind(project_id)
+    .bind(caller.org_id)
+    .execute(&mut *tx)
+    .await?;
+    if updated.rows_affected() == 0 {
+        return Err(ApiError::NotFound);
+    }
+
+    tx.commit().await?;
+    audit(db.as_mut(), &caller, "project.delete", Some(project_id), json!({ "profiles": profiles })).await?;
+    Ok(Json(json!({ "deleted": true, "profiles": profiles })))
+}
+
+async fn list_profiles(
+    mut db: auth::Db,
+    Path(project_id): Path<Uuid>,
+) -> ApiResult<Json<Vec<ProfileSummary>>> {
+    // Copied out so that reading it does not borrow the connection: a
+    // handler needs both in the same expression constantly.
+    let caller = db.caller;
+
+    profiles_in(db.as_mut(), &caller.clone(), project_id).await
+}
+
+pub(crate) async fn profiles_in(
+    db: &mut sqlx::PgConnection,
+    caller: &Caller,
+    project_id: Uuid,
+) -> ApiResult<Json<Vec<ProfileSummary>>> {
+    let perms = rbac_guard::permissions_for(&mut *db, caller.user_id, project_id).await?;
+    if perms == PermSet::NONE {
+        return Err(ApiError::NotFound);
+    }
+    if !perms.has(Perm::View) {
+        return Err(ApiError::Denied(Perm::View));
+    }
+
+    let reveal = perms.has(Perm::RevealSecrets);
+
+    let rows: Vec<(
+        Uuid, String, Vec<String>, String, i32,
+        Option<Uuid>, Option<String>, Option<String>, Option<String>, Option<String>,
+        Option<Uuid>, Option<String>, Option<String>, Option<String>, Option<String>,
+        String,
+    )> = sqlx::query_as(
+        &format!(
+            r#"
+        SELECT f.id, f.name, f.tags, f.persona_id, f.current_version,
+               x.id, x.name, x.kind::text, x.host || ':' || x.port, x.last_country,
+               l.user_id, u.email, l.machine_name,
+               {acquired}, {expires}, p.name
+        FROM profiles f
+        JOIN projects p ON p.id = f.project_id
+        LEFT JOIN proxies x ON x.id = f.proxy_id AND x.deleted_at IS NULL
+        LEFT JOIN profile_locks l ON l.profile_id = f.id AND l.expires_at > now()
+        LEFT JOIN users u ON u.id = l.user_id
+        WHERE f.project_id = $1 AND f.deleted_at IS NULL
+        ORDER BY f.name
+        "#,
+            acquired = rfc3339("l.acquired_at"),
+            expires = rfc3339("l.expires_at"),
+        ),
+    )
+    .bind(project_id)
+    .fetch_all(&mut *db)
+    .await?;
+
+    let out = rows
+        .into_iter()
+        .map(
+            |(
+                id, name, tags, persona_id, current_version,
+                proxy_id, proxy_name, proxy_kind, proxy_host, proxy_country,
+                lock_user, lock_email, lock_machine, lock_acquired, lock_expires,
+                project_name,
+            )| {
+                ProfileSummary {
+                    // Filled in below: the row above is already at sqlx's
+                    // sixteen-column limit for tuples, and one more would have
+                    // meant a named struct for a single integer.
+                    shared_with: 0,
+                    bundle_bytes: None,
+                    notes: String::new(),
+                    start_urls: Vec::new(),
+                    status: String::new(),
+                    timezone: None,
+                    languages: Vec::new(),
+                    overrides: MachineOverrides::default(),
+                    last_opened_at: None,
+                    id,
+                    project_id,
+                    project_name,
+                    name,
+                    tags,
+                    persona_id,
+                    current_version,
+                    proxy: proxy_id.map(|pid| ProxySummary {
+                        id: pid,
+                        name: proxy_name.unwrap_or_default(),
+                        kind: proxy_kind.unwrap_or_default(),
+                        // Without reveal_secrets the host is masked here, on the
+                        // server. Masking in the UI would still have sent the
+                        // real value over the wire.
+                        // host:port in both cases. The first version showed
+                        // only the host, and a provider selling fifty exits
+                        // behind one gateway made every profile look identical.
+                        display: match (&proxy_host, reveal) {
+                            (Some(h), true) => h.clone(),
+                            (Some(h), false) => match h.rsplit_once(':') {
+                                Some((host, port)) => format!("{}:{port}", mask_host(host)),
+                                None => mask_host(h),
+                            },
+                            (None, _) => String::new(),
+                        },
+                        country: proxy_country,
+                        detected_kind: None,
+                        last_checked_at: None,
+                        shared_with_profiles: 0,
+                        added_by: None,
+                        may_change: None,
+                    }),
+                    lock: lock_user.map(|uid| LockInfo {
+                        user_id: uid,
+                        user_email: lock_email.unwrap_or_default(),
+                        machine_name: lock_machine.unwrap_or_default(),
+                        acquired_at: lock_acquired.unwrap_or_default(),
+                        expires_at: lock_expires.unwrap_or_default(),
+                    }),
+                    permissions: perms.to_vec(),
+                }
+            },
+        )
+        .collect();
+
+    Ok(Json(with_share_counts(&mut *db, out).await?))
+}
+
+/// Fill in what the listing query could not carry: how many people hold each
+/// profile, its notes and its start URLs, and when it was last launched.
+///
+/// Separate queries for the whole page rather than columns on the listing
+/// query: that row is already at sqlx's sixteen-element limit for tuple
+/// decoding. Two queries rather than one per row, which is the part that
+/// matters on a project with two hundred profiles.
+///
+/// Notes and start URLs joined this function on 12.09.2026 for a reason that
+/// is a bug report: the editor opens from a row, filled the two boxes from the
+/// row, found nothing there, and saved nothing back. Every edit of a team
+/// profile through the desktop erased both.
+async fn with_share_counts(
+    db: &mut sqlx::PgConnection,
+    mut rows: Vec<ProfileSummary>,
+) -> ApiResult<Vec<ProfileSummary>> {
+    if rows.is_empty() {
+        return Ok(rows);
+    }
+    let ids: Vec<Uuid> = rows.iter().map(|r| r.id).collect();
+    #[allow(clippy::type_complexity)]
+    let details: Vec<(Uuid, String, Vec<String>, String, Option<String>, Vec<String>, sqlx::types::Json<MachineOverrides>)> =
+        sqlx::query_as(
+            "SELECT id, notes, start_urls, status, timezone, languages, overrides \
+             FROM profiles WHERE id = ANY($1)",
+        )
+        .bind(&ids)
+        .fetch_all(&mut *db)
+        .await?;
+    for (id, notes, start_urls, status, timezone, languages, overrides) in details {
+        if let Some(row) = rows.iter_mut().find(|r| r.id == id) {
+            row.notes = notes;
+            row.start_urls = start_urls;
+            row.status = status;
+            row.timezone = timezone;
+            row.languages = languages;
+            row.overrides = overrides.0;
+        }
+    }
+    // The last launch, from the audit rather than a column: every lock taken
+    // has been recorded there as `profile.launch` since the first release, so
+    // the answer is right at once for every launch already made, and there is
+    // no second copy of the fact to fall out of step with the first.
+    let launched: Vec<(Uuid, String)> = sqlx::query_as(&format!(
+        "SELECT target_id, {} FROM audit_events \
+         WHERE target_id = ANY($1) AND action = 'profile.launch' \
+         GROUP BY target_id",
+        rfc3339("max(at)")
+    ))
+    .bind(&ids)
+    .fetch_all(&mut *db)
+    .await?;
+    for (id, at) in launched {
+        if let Some(row) = rows.iter_mut().find(|r| r.id == id) {
+            row.last_opened_at = Some(at);
+        }
+    }
+    // How much each one weighs on the server, which is the question an
+    // operator asks before sending a profile there (tester, 08.10.2026): the
+    // current version's bundle, as stored -- encrypted and compressed.
+    let sizes: Vec<(Uuid, i64)> = sqlx::query_as(
+        "SELECT b.profile_id, b.size_bytes FROM bundles b \
+         JOIN profiles f ON f.id = b.profile_id AND b.version = f.current_version \
+         WHERE b.profile_id = ANY($1)",
+    )
+    .bind(&ids)
+    .fetch_all(&mut *db)
+    .await?;
+    for (id, bytes) in sizes {
+        if let Some(row) = rows.iter_mut().find(|r| r.id == id) {
+            row.bundle_bytes = Some(bytes);
+        }
+    }
+    let counts: Vec<(Uuid, i64)> = sqlx::query_as(
+        "SELECT profile_id, count(*) FROM profile_grants \
+         WHERE profile_id = ANY($1) AND wrapped_key IS NOT NULL \
+           AND (expires_at IS NULL OR expires_at > now()) \
+         GROUP BY profile_id",
+    )
+    .bind(&ids)
+    .fetch_all(&mut *db)
+    .await?;
+
+    for (id, n) in counts {
+        if let Some(row) = rows.iter_mut().find(|r| r.id == id) {
+            row.shared_with = n;
+        }
+    }
+    Ok(rows)
+}
+
+/// Every profile the caller may see, across every project.
+///
+/// The interface's Profiles view is the flat list of everything an operator can
+/// work with, and a project narrows it. Without this the team-mode version of
+/// that screen was empty until somebody clicked a project — the first thing a
+/// new member sees being "nothing here" while their work sits one click away.
+///
+/// Resolved per project rather than in one query with a join, because the
+/// permissions differ per project and a row must carry the ones that apply to
+/// it. It is a handful of small queries against an index, and the alternative
+/// is a query whose correctness nobody can check by reading it.
+async fn list_all_profiles(
+    mut db: auth::Db,
+) -> ApiResult<Json<Vec<ProfileSummary>>> {
+    // Copied out so that reading it does not borrow the connection: a
+    // handler needs both in the same expression constantly.
+    let caller = db.caller;
+
+    let projects: Vec<(Uuid,)> = sqlx::query_as(
+        "SELECT p.id FROM projects p \
+         JOIN org_members m ON m.org_id = p.org_id AND m.user_id = $1 \
+         LEFT JOIN project_grants g ON g.project_id = p.id AND g.user_id = $1 \
+                AND (g.expires_at IS NULL OR g.expires_at > now()) \
+         WHERE p.deleted_at IS NULL AND ($2 OR g.permissions IS NOT NULL) \
+         ORDER BY p.name",
+    )
+    .bind(caller.user_id)
+    .bind(fury_shared::rbac::has_implicit_project_access(caller.role))
+    .fetch_all(db.as_mut())
+    .await?;
+
+    let mut out = Vec::new();
+    for (project_id,) in projects {
+        // Reusing the per-project handler rather than a second copy of its
+        // query: two listings that drift apart is how one of them starts
+        // showing an unmasked host.
+        let Json(mut rows) = profiles_in(db.as_mut(), &caller, project_id).await?;
+        out.append(&mut rows);
+    }
+    out.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
+    Ok(Json(out))
+}
+
+/// SQL that renders a `timestamptz` as RFC 3339 in UTC.
+///
+/// Every timestamp crossing the wire goes through this. The first version used
+/// `to_char(..., 'OF')`, which writes a whole-hour offset as `+00` — legal in
+/// Postgres, not legal in RFC 3339, and `new Date()` in the UI answered
+/// `Invalid Date`. Converting to UTC and appending a literal `Z` removes the
+/// variability instead of trying to spell the offset correctly: there is one
+/// possible output shape, and it parses everywhere.
+///
+/// The argument is always a column reference written in this file, never
+/// anything derived from a request.
+pub(crate) fn rfc3339(column: &str) -> String {
+    format!(r#"to_char({column} AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"')"#)
+}
+
+/// Keeps enough of a hostname to tell two proxies apart, not enough to reuse
+/// one. An operator must be able to see which exit a profile uses without
+/// walking away with the organisation's proxy list.
+///
+/// The trailing hash is what makes this work, and its absence is what the first
+/// version got wrong: truncating to a prefix mapped `res-eu-01.provider.net`
+/// and `res-us-02.provider.net` — the ordinary case, two exits from one
+/// provider — onto the same string, so the operator could not tell which proxy
+/// a profile used. A short digest of the whole host distinguishes reliably and
+/// discloses nothing.
+fn mask_host(host: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let digest = Sha256::digest(host.as_bytes());
+    let tag = format!("{:02x}{:02x}", digest[0], digest[1]);
+    match host.split_once('.') {
+        // Only show a prefix when the label is long enough that hiding the rest
+        // still hides something. For "ab" a three-character prefix is the whole
+        // label, so nothing is masked at all.
+        Some((first, rest)) if first.chars().count() > 4 => {
+            let head: String = first.chars().take(3).collect();
+            format!("{head}***{tag}.{rest}")
+        }
+        Some((_, rest)) => format!("***{tag}.{rest}"),
+        None => format!("***{tag}"),
+    }
+}
+
+async fn grant_access(
+    mut db: auth::Db,
+    Path(project_id): Path<Uuid>,
+    Json(req): Json<GrantRequest>,
+) -> ApiResult<Json<serde_json::Value>> {
+    // Copied out so that reading it does not borrow the connection: a
+    // handler needs both in the same expression constantly.
+    let caller = db.caller;
+
+    rbac_guard::require(db.as_mut(), caller.user_id, project_id, Perm::ManageAccess).await?;
+
+    // The grant is capped by the recipient's org role, not the granter's. A
+    // manager cannot promote a member past what a member may ever hold — see
+    // role_ceiling in shared-rs.
+    let target_role: Option<(String,)> = sqlx::query_as(
+        "SELECT m.role::text FROM org_members m \
+         JOIN projects p ON p.org_id = m.org_id \
+         WHERE m.user_id = $1 AND p.id = $2",
+    )
+    .bind(req.user_id)
+    .bind(project_id)
+    .fetch_optional(db.as_mut())
+    .await?;
+
+    let Some((role,)) = target_role else {
+        return Err(ApiError::BadRequest(
+            "that user is not a member of this organisation".into(),
+        ));
+    };
+    let role = auth::parse_role(&role).ok_or(ApiError::NotFound)?;
+
+    // Which of the organisation's own roles the grant follows (0017). Absent
+    // keeps the current link, so attaching a domain list to somebody on
+    // "operator" leaves them on "operator"; null unlinks.
+    let link: Option<Uuid> = match req.access_role {
+        Some(link) => link,
+        None => sqlx::query_scalar::<_, Option<Uuid>>(
+            "SELECT access_role FROM project_grants WHERE project_id = $1 AND user_id = $2",
+        )
+        .bind(project_id)
+        .bind(req.user_id)
+        .fetch_optional(db.as_mut())
+        .await?
+        .flatten(),
+    };
+    let requested = match link {
+        Some(id) => {
+            let bits: Option<i64> = sqlx::query_scalar(
+                "SELECT permissions FROM org_access_roles WHERE id = $1 AND org_id = $2",
+            )
+            .bind(id)
+            .bind(caller.org_id)
+            .fetch_optional(db.as_mut())
+            .await?;
+            PermSet(bits.ok_or_else(|| ApiError::BadRequest("that role does not exist in this organisation".into()))?)
+        }
+        None => PermSet::from_iter(req.permissions.iter().copied()),
+    };
+    let capped = requested.intersect(fury_shared::rbac::role_ceiling(role));
+
+    // $5::timestamptz, not $5. The expiry arrives as an RFC 3339 string — the
+    // same shape this API hands out — and Postgres will not coerce text into a
+    // timestamptz in a parameter position. Without the cast every grant failed
+    // with a 500, which is to say access could not be given to anybody at all.
+    // Domain lists: the organisation's, by id, and only ones that exist in
+    // this organisation — a foreign id would be a list nobody here can read.
+    let lists: Option<Vec<Uuid>> = match &req.domain_lists {
+        None => None,
+        Some(ids) if ids.is_empty() => Some(Vec::new()),
+        Some(ids) => {
+            let known: Vec<(Uuid,)> = sqlx::query_as(
+                "SELECT id FROM org_domain_lists WHERE org_id = $1 AND id = ANY($2)",
+            )
+            .bind(caller.org_id)
+            .bind(ids)
+            .fetch_all(db.as_mut())
+            .await?;
+            if known.len() != ids.len() {
+                return Err(ApiError::BadRequest("one of the domain lists does not exist in this organisation".into()));
+            }
+            Some(known.into_iter().map(|(id,)| id).collect())
+        }
+    };
+    sqlx::query(
+        "INSERT INTO project_grants (project_id, user_id, permissions, granted_by, expires_at, domain_lists, access_role) \
+         VALUES ($1, $2, $3, $4, $5::timestamptz, COALESCE($6, '{}'), $7) \
+         ON CONFLICT (project_id, user_id) DO UPDATE \
+         SET permissions = EXCLUDED.permissions, granted_by = EXCLUDED.granted_by, \
+             granted_at = now(), expires_at = EXCLUDED.expires_at, \
+             domain_lists = COALESCE($6, project_grants.domain_lists), \
+             access_role = EXCLUDED.access_role",
+    )
+    .bind(project_id)
+    .bind(req.user_id)
+    .bind(capped.0)
+    .bind(caller.user_id)
+    .bind(req.expires_at.as_deref())
+    .bind(lists.as_deref())
+    .bind(link)
+    .execute(db.as_mut())
+    .await?;
+
+    audit(db.as_mut(), &caller, "access.grant", Some(project_id),
+          json!({ "target": req.user_id, "requested": requested.to_vec(), "granted": capped.to_vec(),
+                  "domain_lists": req.domain_lists, "access_role": link }))
+        .await?;
+
+    Ok(Json(json!({ "granted": capped.to_vec(), "access_role": link })))
+}
+
+// ---- the organisation's domain lists ---------------------------------------
+
+#[derive(Deserialize)]
+struct DomainListUpsert {
+    #[serde(default)]
+    id: Option<Uuid>,
+    name: String,
+    body: String,
+}
+
+/// `GET /v1/org/domain-lists` — everyone in the organisation may read them:
+/// a member sees which lists apply to them. Writing needs manage_access.
+/// The machines a profile in this organisation may be: the catalogue the
+/// server was built with, then the organisation's own (0016), which may not
+/// reuse a built-in id. A stored persona that no longer parses -- a schema
+/// change since it was added -- is left out rather than failing every lookup.
+pub(crate) async fn org_catalogue(db: &mut sqlx::PgConnection, org_id: Uuid) -> ApiResult<Vec<fury_shared::Persona>> {
+    let mut catalogue = fury_shared::catalogue::all();
+    let rows: Vec<(String, serde_json::Value)> =
+        sqlx::query_as("SELECT id, persona FROM org_personas WHERE org_id = $1 ORDER BY id")
+            .bind(org_id)
+            .fetch_all(&mut *db)
+            .await?;
+    for (id, value) in rows {
+        match serde_json::from_value::<fury_shared::Persona>(value) {
+            Ok(p) if p.id == id && !catalogue.iter().any(|b| b.id == id) => catalogue.push(p),
+            Ok(_) => {}
+            Err(e) => tracing::warn!(persona = %id, error = %e, "an organisation persona no longer parses"),
+        }
+    }
+    Ok(catalogue)
+}
+
+/// The organisation's machines, whole, for every member's shell to hand its
+/// agent: a team profile on one of them opens on any computer in the team.
+async fn list_org_personas(mut db: auth::Db) -> ApiResult<Json<serde_json::Value>> {
+    let caller = db.caller;
+    let rows: Vec<(String, serde_json::Value, Option<String>, String)> = sqlx::query_as(&format!(
+        "SELECT p.id, p.persona, u.email, {} FROM org_personas p \
+         LEFT JOIN users u ON u.id = p.created_by WHERE p.org_id = $1 ORDER BY p.id",
+        rfc3339("p.created_at")
+    ))
+    .bind(caller.org_id)
+    .fetch_all(db.as_mut())
+    .await?;
+    Ok(Json(json!(rows
+        .into_iter()
+        .map(|(id, persona, by, at)| json!({ "id": id, "persona": persona, "created_by": by, "created_at": at }))
+        .collect::<Vec<_>>())))
+}
+
+#[derive(Deserialize)]
+pub struct OrgPersonaRequest {
+    persona: serde_json::Value,
+}
+
+/// Add a captured machine to the organisation, or replace one of the same id.
+///
+/// Whoever may create profiles somewhere may add the machine to make them on;
+/// replacing one is for its author, an owner or an admin, because profiles of
+/// colleagues may already be on it. Validated with the agent's own rules, so
+/// what is stored is a machine that can exist.
+async fn add_org_persona(mut db: auth::Db, Json(req): Json<OrgPersonaRequest>) -> ApiResult<Json<serde_json::Value>> {
+    let caller = db.caller;
+    if !rbac_guard::holds_somewhere(db.as_mut(), caller.user_id, caller.org_id, caller.role, Perm::CreateProfile).await? {
+        return Err(ApiError::Denied(Perm::CreateProfile));
+    }
+    let persona: fury_shared::Persona = serde_json::from_value(req.persona.clone())
+        .map_err(|e| ApiError::BadRequest(format!("this is not a persona: {e}")))?;
+    let id = persona.id.clone();
+    if id.is_empty() || id.len() > 100 || !id.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_') {
+        return Err(ApiError::BadRequest("a persona id is letters, digits, - and _, up to 100".into()));
+    }
+    if fury_shared::catalogue::all().iter().any(|b| b.id == id) {
+        return Err(ApiError::BadRequest(format!("{id:?} is already in the built-in catalogue")));
+    }
+    if let Err(errs) = persona.validate() {
+        return Err(ApiError::BadRequest(format!(
+            "this machine could not exist: {}",
+            errs.iter().map(|e| e.to_string()).collect::<Vec<_>>().join("; ")
+        )));
+    }
+    let existing: Option<Option<Uuid>> =
+        sqlx::query_scalar("SELECT created_by FROM org_personas WHERE org_id = $1 AND id = $2")
+            .bind(caller.org_id)
+            .bind(&id)
+            .fetch_optional(db.as_mut())
+            .await?;
+    if let Some(author) = existing {
+        let mine = author == Some(caller.user_id);
+        if !mine && !fury_shared::rbac::has_implicit_project_access(caller.role) {
+            return Err(ApiError::Refused("persona_not_yours"));
+        }
+    }
+    sqlx::query(
+        "INSERT INTO org_personas (org_id, id, persona, created_by) VALUES ($1, $2, $3, $4) \
+         ON CONFLICT (org_id, id) DO UPDATE SET persona = EXCLUDED.persona, updated_at = now()",
+    )
+    .bind(caller.org_id)
+    .bind(&id)
+    .bind(&req.persona)
+    .bind(caller.user_id)
+    .execute(db.as_mut())
+    .await?;
+    audit(db.as_mut(), &caller, "persona.saved", None, json!({ "id": id })).await?;
+    Ok(Json(json!({ "id": id })))
+}
+
+/// Remove one, if no profile is on it: a profile whose machine is gone would
+/// refuse to launch on every computer at once.
+async fn delete_org_persona(mut db: auth::Db, Path(id): Path<String>) -> ApiResult<Json<serde_json::Value>> {
+    let caller = db.caller;
+    let author: Option<Option<Uuid>> =
+        sqlx::query_scalar("SELECT created_by FROM org_personas WHERE org_id = $1 AND id = $2")
+            .bind(caller.org_id)
+            .bind(&id)
+            .fetch_optional(db.as_mut())
+            .await?;
+    let Some(author) = author else { return Err(ApiError::NotFound) };
+    if author != Some(caller.user_id) && !fury_shared::rbac::has_implicit_project_access(caller.role) {
+        return Err(ApiError::Refused("persona_not_yours"));
+    }
+    let used: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM profiles WHERE org_id = $1 AND persona_id = $2 AND deleted_at IS NULL",
+    )
+    .bind(caller.org_id)
+    .bind(&id)
+    .fetch_one(db.as_mut())
+    .await?;
+    if used > 0 {
+        return Err(ApiError::Conflict(format!("{used} profile(s) are on this machine; move them to another first")));
+    }
+    sqlx::query("DELETE FROM org_personas WHERE org_id = $1 AND id = $2")
+        .bind(caller.org_id)
+        .bind(&id)
+        .execute(db.as_mut())
+        .await?;
+    audit(db.as_mut(), &caller, "persona.deleted", None, json!({ "id": id })).await?;
+    Ok(Json(json!({ "deleted": true })))
+}
+
+async fn list_domain_lists(mut db: auth::Db) -> ApiResult<Json<serde_json::Value>> {
+    let caller = db.caller;
+    let rows: Vec<(Uuid, String, String, String)> = sqlx::query_as(&format!(
+        "SELECT id, name, body, {} FROM org_domain_lists WHERE org_id = $1 ORDER BY name",
+        rfc3339("updated_at")
+    ))
+    .bind(caller.org_id)
+    .fetch_all(db.as_mut())
+    .await?;
+    Ok(Json(json!(rows
+        .into_iter()
+        .map(|(id, name, body, updated_at)| {
+            let parsed = fury_shared::domains::summarise(&body);
+            json!({ "id": id, "name": name, "body": body, "updated_at": updated_at,
+                    "domains": parsed.entries, "allow_only": parsed.allow_only, "local": parsed.local })
+        })
+        .collect::<Vec<_>>())))
+}
+
+async fn upsert_domain_list(mut db: auth::Db, Json(req): Json<DomainListUpsert>) -> ApiResult<Json<serde_json::Value>> {
+    let caller = db.caller;
+    if !matches!(caller.role, fury_shared::rbac::OrgRole::Owner | fury_shared::rbac::OrgRole::Admin) {
+        return Err(ApiError::Denied(Perm::ManageAccess));
+    }
+    let name = req.name.trim();
+    if name.is_empty() || name.len() > 64 {
+        return Err(ApiError::BadRequest("a list needs a name of up to 64 characters".into()));
+    }
+    let domains = fury_shared::domains::summarise(&req.body).entries;
+    if domains == 0 {
+        return Err(ApiError::BadRequest("the list names no domains — check the format: a hosts file, an Adblock list, or one domain per line".into()));
+    }
+    let id = req.id.unwrap_or_else(Uuid::now_v7);
+    sqlx::query(
+        "INSERT INTO org_domain_lists (id, org_id, name, body, created_by) VALUES ($1, $2, $3, $4, $5) \
+         ON CONFLICT (id) DO UPDATE SET name = EXCLUDED.name, body = EXCLUDED.body, updated_at = now()",
+    )
+    .bind(id)
+    .bind(caller.org_id)
+    .bind(name)
+    .bind(&req.body)
+    .bind(caller.user_id)
+    .execute(db.as_mut())
+    .await
+    .map_err(|e| match e {
+        sqlx::Error::Database(ref d) if d.is_unique_violation() => ApiError::Conflict(format!("a list named {name:?} already exists")),
+        other => ApiError::Db(other),
+    })?;
+    audit(db.as_mut(), &caller, "domain_list.saved", Some(id), json!({ "name": name, "domains": domains })).await?;
+    Ok(Json(json!({ "id": id, "domains": domains })))
+}
+
+async fn delete_domain_list(mut db: auth::Db, Path(id): Path<Uuid>) -> ApiResult<Json<serde_json::Value>> {
+    let caller = db.caller;
+    if !matches!(caller.role, fury_shared::rbac::OrgRole::Owner | fury_shared::rbac::OrgRole::Admin) {
+        return Err(ApiError::Denied(Perm::ManageAccess));
+    }
+    let n = sqlx::query("DELETE FROM org_domain_lists WHERE id = $1 AND org_id = $2")
+        .bind(id)
+        .bind(caller.org_id)
+        .execute(db.as_mut())
+        .await?
+        .rows_affected();
+    if n == 0 {
+        return Err(ApiError::NotFound);
+    }
+    // Grants that pointed at it keep the id in their array; the launch join
+    // simply finds nothing for it. Cleaned here so the grant screen does not
+    // show a ghost.
+    sqlx::query(
+        "UPDATE project_grants g SET domain_lists = array_remove(g.domain_lists, $1) \
+         FROM projects p WHERE p.id = g.project_id AND p.org_id = $2 AND $1 = ANY(g.domain_lists)",
+    )
+    .bind(id)
+    .bind(caller.org_id)
+    .execute(db.as_mut())
+    .await?;
+    audit(db.as_mut(), &caller, "domain_list.deleted", Some(id), json!({})).await?;
+    Ok(Json(json!({ "deleted": true })))
+}
+
+// ---- the organisation's own roles (0017) ------------------------------------
+
+#[derive(Deserialize)]
+struct AccessRoleUpsert {
+    #[serde(default)]
+    id: Option<Uuid>,
+    name: String,
+    permissions: Vec<Perm>,
+}
+
+/// `GET /v1/org/access-roles` -- everyone in the organisation may read them: a
+/// manager giving access inside a project picks from the same list, and a
+/// member sees what the name on their row means.
+async fn list_access_roles(mut db: auth::Db) -> ApiResult<Json<serde_json::Value>> {
+    let caller = db.caller;
+    let rows: Vec<(Uuid, String, i64, String, i64)> = sqlx::query_as(&format!(
+        "SELECT r.id, r.name, r.permissions, {}, \
+                (SELECT count(*) FROM project_grants g WHERE g.access_role = r.id) \
+         FROM org_access_roles r WHERE r.org_id = $1 ORDER BY r.name",
+        rfc3339("r.updated_at")
+    ))
+    .bind(caller.org_id)
+    .fetch_all(db.as_mut())
+    .await?;
+    Ok(Json(json!(rows
+        .into_iter()
+        .map(|(id, name, perms, updated_at, grants)| json!({
+            "id": id, "name": name, "permissions": PermSet(perms).to_vec(),
+            "updated_at": updated_at, "grants": grants,
+        }))
+        .collect::<Vec<_>>())))
+}
+
+async fn upsert_access_role(mut db: auth::Db, Json(req): Json<AccessRoleUpsert>) -> ApiResult<Json<serde_json::Value>> {
+    let caller = db.caller;
+    if !matches!(caller.role, fury_shared::rbac::OrgRole::Owner | fury_shared::rbac::OrgRole::Admin) {
+        return Err(ApiError::Denied(Perm::ManageAccess));
+    }
+    let name = req.name.trim();
+    if name.is_empty() || name.chars().count() > 64 {
+        return Err(ApiError::BadRequest("a role needs a name of up to 64 characters".into()));
+    }
+    // Seeing the profiles is what being let into a project is; a role without
+    // it would put people on the project's list who can reach none of it.
+    let perms = PermSet::from_iter(req.permissions.iter().copied()).with(Perm::View);
+
+    let id = req.id.unwrap_or_else(Uuid::now_v7);
+    let mut tx = db.begin().await?;
+    // The update is limited to this organisation's row: an id from another
+    // organisation is a role that does not exist here, not one to overwrite.
+    let written = sqlx::query(
+        "INSERT INTO org_access_roles (id, org_id, name, permissions, created_by) VALUES ($1, $2, $3, $4, $5) \
+         ON CONFLICT (id) DO UPDATE SET name = EXCLUDED.name, permissions = EXCLUDED.permissions, updated_at = now() \
+         WHERE org_access_roles.org_id = EXCLUDED.org_id",
+    )
+    .bind(id)
+    .bind(caller.org_id)
+    .bind(name)
+    .bind(perms.0)
+    .bind(caller.user_id)
+    .execute(&mut *tx)
+    .await
+    .map_err(|e| match e {
+        sqlx::Error::Database(ref d) if d.is_unique_violation() => ApiError::Conflict(format!("a role named {name:?} already exists")),
+        other => ApiError::Db(other),
+    })?
+    .rows_affected();
+    if written == 0 {
+        return Err(ApiError::NotFound);
+    }
+    let relinked = relink(&mut tx, Some(id), None).await?;
+    tx.commit().await?;
+
+    audit(db.as_mut(), &caller, "access_role.saved", Some(id),
+          json!({ "name": name, "permissions": perms.to_vec(), "grants_rewritten": relinked }))
+        .await?;
+    Ok(Json(json!({ "id": id, "grants_rewritten": relinked })))
+}
+
+async fn delete_access_role(mut db: auth::Db, Path(id): Path<Uuid>) -> ApiResult<Json<serde_json::Value>> {
+    let caller = db.caller;
+    if !matches!(caller.role, fury_shared::rbac::OrgRole::Owner | fury_shared::rbac::OrgRole::Admin) {
+        return Err(ApiError::Denied(Perm::ManageAccess));
+    }
+    // The grants on it keep the boxes they have and lose the link (ON DELETE
+    // SET NULL): nobody's access changes because a name went off the list.
+    let n = sqlx::query("DELETE FROM org_access_roles WHERE id = $1 AND org_id = $2")
+        .bind(id)
+        .bind(caller.org_id)
+        .execute(db.as_mut())
+        .await?
+        .rows_affected();
+    if n == 0 {
+        return Err(ApiError::NotFound);
+    }
+    audit(db.as_mut(), &caller, "access_role.deleted", Some(id), json!({})).await?;
+    Ok(Json(json!({ "deleted": true })))
+}
+
+/// Rewrite `permissions` on the grants that follow a role, from the role's
+/// boxes capped by each person's org role -- the same cap `grant_access`
+/// applies, from the same `role_ceiling`, so a linked grant never holds what a
+/// hand-ticked one could not. Narrowed to one role, one person, or both.
+///
+/// This is what keeps every check in the server reading one column: the link
+/// is resolved when it changes, not on every request.
+pub(crate) async fn relink(
+    db: &mut sqlx::PgConnection,
+    role_id: Option<Uuid>,
+    user_id: Option<Uuid>,
+) -> ApiResult<u64> {
+    let rows: Vec<(Uuid, Uuid, String, i64)> = sqlx::query_as(
+        "SELECT g.project_id, g.user_id, m.role::text, r.permissions \
+         FROM project_grants g \
+         JOIN org_access_roles r ON r.id = g.access_role \
+         JOIN projects p ON p.id = g.project_id \
+         JOIN org_members m ON m.org_id = p.org_id AND m.user_id = g.user_id \
+         WHERE ($1::uuid IS NULL OR g.access_role = $1) \
+           AND ($2::uuid IS NULL OR g.user_id = $2)",
+    )
+    .bind(role_id)
+    .bind(user_id)
+    .fetch_all(&mut *db)
+    .await?;
+    let mut n = 0;
+    for (project_id, user_id, org_role, bits) in rows {
+        let Some(org_role) = auth::parse_role(&org_role) else { continue };
+        let capped = PermSet(bits).intersect(fury_shared::rbac::role_ceiling(org_role));
+        n += sqlx::query("UPDATE project_grants SET permissions = $3 WHERE project_id = $1 AND user_id = $2")
+            .bind(project_id)
+            .bind(user_id)
+            .bind(capped.0)
+            .execute(&mut *db)
+            .await?
+            .rows_affected();
+    }
+    Ok(n)
+}
+
+/// Who can reach this project, and with what.
+///
+/// Owners and admins reach every project implicitly and have no grant row, so
+/// they are listed separately rather than omitted — a screen that showed only
+/// the rows would read as "nobody else can see this", which is false.
+async fn list_grants(
+    mut db: auth::Db,
+    Path(project_id): Path<Uuid>,
+) -> ApiResult<Json<serde_json::Value>> {
+    // Copied out so that reading it does not borrow the connection: a
+    // handler needs both in the same expression constantly.
+    let caller = db.caller;
+
+    rbac_guard::require(db.as_mut(), caller.user_id, project_id, Perm::ManageAccess).await?;
+
+    let rows: Vec<(Uuid, String, String, i64, Option<String>, Vec<Uuid>, Option<Uuid>)> = sqlx::query_as(
+        &format!(
+        "SELECT u.id, u.email, m.role::text, g.permissions, {}, g.domain_lists, g.access_role \
+         FROM project_grants g \
+         JOIN users u ON u.id = g.user_id \
+         JOIN projects p ON p.id = g.project_id \
+         JOIN org_members m ON m.user_id = u.id AND m.org_id = p.org_id \
+         WHERE g.project_id = $1 \
+         ORDER BY u.email",
+        rfc3339("g.expires_at"),
+    ))
+    .bind(project_id)
+    .fetch_all(db.as_mut())
+    .await?;
+
+    let implicit: Vec<(Uuid, String, String)> = sqlx::query_as(
+        "SELECT u.id, u.email, m.role::text \
+         FROM org_members m \
+         JOIN users u ON u.id = m.user_id \
+         JOIN projects p ON p.org_id = m.org_id \
+         WHERE p.id = $1 AND m.role IN ('owner', 'admin') \
+         ORDER BY u.email",
+    )
+    .bind(project_id)
+    .fetch_all(db.as_mut())
+    .await?;
+
+    Ok(Json(json!({
+        "granted": rows.iter().map(|(id, email, role, perms, expires, lists, access_role)| json!({
+            "user_id": id,
+            "email": email,
+            "role": role,
+            "permissions": PermSet(*perms).to_vec(),
+            "expires_at": expires,
+            "domain_lists": lists,
+            "access_role": access_role,
+        })).collect::<Vec<_>>(),
+        "implicit": implicit.iter().map(|(id, email, role)| json!({
+            "user_id": id, "email": email, "role": role,
+        })).collect::<Vec<_>>(),
+    })))
+}
+
+/// Take a project away from someone.
+///
+/// Deleting the grant is immediate and total: permissions are resolved per
+/// request, never cached in a token, which is the reason sessions are opaque
+/// and revocable in the first place (auth.rs). What it does not do is reach
+/// into bundles they already downloaded — the honest boundary of any system
+/// where work happens on the operator's own machine.
+async fn revoke_access(
+    mut db: auth::Db,
+    Path((project_id, user_id)): Path<(Uuid, Uuid)>,
+) -> ApiResult<Json<serde_json::Value>> {
+    // Copied out so that reading it does not borrow the connection: a
+    // handler needs both in the same expression constantly.
+    let caller = db.caller;
+
+    rbac_guard::require(db.as_mut(), caller.user_id, project_id, Perm::ManageAccess).await?;
+
+    sqlx::query("DELETE FROM project_grants WHERE project_id = $1 AND user_id = $2")
+        .bind(project_id)
+        .bind(user_id)
+        .execute(db.as_mut())
+        .await?;
+
+    // Any lock they hold goes too. Otherwise a revoked operator's browser keeps
+    // a profile marked in-use for as long as its heartbeat runs, and the team
+    // cannot open a profile they no longer have any right to.
+    sqlx::query(
+        "DELETE FROM profile_locks l USING profiles p \
+         WHERE l.profile_id = p.id AND p.project_id = $1 AND l.user_id = $2",
+    )
+    .bind(project_id)
+    .bind(user_id)
+    .execute(db.as_mut())
+    .await?;
+
+    audit(db.as_mut(), &caller, "access.revoke", Some(project_id), json!({ "target": user_id })).await?;
+    Ok(Json(json!({ "revoked": true })))
+}
+
+// ---------------------------------------------------------------------------
+// proxies and profiles
+// ---------------------------------------------------------------------------
+
+fn unhex(what: &str, v: &str) -> Result<Vec<u8>, ApiError> {
+    if v.len() % 2 != 0 || !v.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Err(ApiError::BadRequest(format!("{what} is not hex")));
+    }
+    (0..v.len())
+        .step_by(2)
+        .map(|i| u8::from_str_radix(&v[i..i + 2], 16).map_err(|_| ApiError::BadRequest(format!("{what} is not hex"))))
+        .collect()
+}
+
+#[derive(Deserialize)]
+pub struct ProxyRequest {
+    name: String,
+    kind: String,
+    host: String,
+    port: i32,
+    /// NULL scopes the proxy to the whole organisation.
+    #[serde(default)]
+    project_id: Option<Uuid>,
+    /// `{username, password}` sealed under a per-proxy data key, hex.
+    credentials_enc: String,
+    /// That data key, wrapped under the organisation key, hex.
+    wrapped_dek: String,
+    #[serde(default)]
+    rotate_url_enc: Option<String>,
+}
+
+/// Add a proxy the team can use.
+///
+/// Owners, admins, and anyone with `edit_proxy` in some project
+/// (`rbac_guard::may_add_proxies`). Until 12.10.2026 it was owners and admins
+/// only, refused as "needs edit_proxy" to people who had it.
+///
+/// The server receives two opaque blobs and stores them. It cannot read either,
+/// and does not try: no field here is parsed beyond checking it is hex and
+/// plausible in length. That is the whole point — a stolen database yields a
+/// list of hostnames, not a working proxy pool.
+async fn create_proxy(
+    mut db: auth::Db,
+    Json(req): Json<ProxyRequest>,
+) -> ApiResult<Json<serde_json::Value>> {
+    // Copied out so that reading it does not borrow the connection: a
+    // handler needs both in the same expression constantly.
+    let caller = db.caller;
+
+    if !rbac_guard::may_add_proxies(db.as_mut(), caller.user_id, caller.org_id, caller.role).await? {
+        return Err(ApiError::Denied(Perm::EditProxy));
+    }
+    if !matches!(req.kind.as_str(), "http" | "https" | "socks5" | "wireguard") {
+        return Err(ApiError::BadRequest("kind must be http, https, socks5 or wireguard".into()));
+    }
+    if !(1..=65535).contains(&req.port) {
+        return Err(ApiError::BadRequest("port must be between 1 and 65535".into()));
+    }
+    if req.host.trim().is_empty() {
+        return Err(ApiError::BadRequest("a proxy needs a host".into()));
+    }
+
+    let credentials_enc = unhex("credentials_enc", &req.credentials_enc)?;
+    let wrapped_dek = unhex("wrapped_dek", &req.wrapped_dek)?;
+    let rotate_url_enc = req
+        .rotate_url_enc
+        .as_deref()
+        .map(|v| unhex("rotate_url_enc", v))
+        .transpose()?;
+    // 24-byte nonce plus a tag: anything shorter cannot be a sealed value, and
+    // storing one would fail on an operator's machine at launch, with nothing
+    // to point at.
+    if wrapped_dek.len() < 40 || credentials_enc.len() < 40 {
+        return Err(ApiError::BadRequest(
+            "credentials_enc and wrapped_dek must be sealed values".into(),
+        ));
+    }
+
+    // Scoped to the caller's organisation, and a project must belong to it.
+    if let Some(project_id) = req.project_id {
+        let ours: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM projects WHERE id = $1 AND org_id = $2)",
+        )
+        .bind(project_id)
+        .bind(caller.org_id)
+        .fetch_one(db.as_mut())
+        .await?;
+        if !ours {
+            return Err(ApiError::NotFound);
+        }
+    }
+
+    let id = Uuid::now_v7();
+    sqlx::query(
+        "INSERT INTO proxies (id, org_id, project_id, name, kind, host, port, \
+                              credentials_enc, wrapped_dek, rotate_url_enc, created_by) \
+         VALUES ($1, $2, $3, $4, $5::proxy_kind, $6, $7, $8, $9, $10, $11)",
+    )
+    .bind(id)
+    .bind(caller.org_id)
+    .bind(req.project_id)
+    .bind(req.name.trim())
+    .bind(&req.kind)
+    .bind(req.host.trim())
+    .bind(req.port)
+    .bind(&credentials_enc)
+    .bind(&wrapped_dek)
+    .bind(&rotate_url_enc)
+    .bind(caller.user_id)
+    .execute(db.as_mut())
+    .await?;
+
+    audit(db.as_mut(), &caller, "proxy.create", Some(id), json!({ "host": req.host })).await?;
+    Ok(Json(json!({ "id": id })))
+}
+
+/// One page of the log, as SQL.
+///
+/// A function rather than a string inside the handler so that a test can run
+/// the real query against a real schema, which is the only thing that would
+/// have caught what was wrong with it: it selected `u.email, u.name`, and users
+/// have never had a name — 0001 gives them an id, an email, keys and
+/// timestamps, and no migration has added one since. Every call to this
+/// endpoint failed in the database and came back a 500, so the team screen has
+/// shown "Request failed (500)" under Actions since the day it was written, and
+/// the audit was unreadable by exactly the people it exists for.
+///
+/// Nothing caught it because the text is assembled with `format!` and run
+/// through `query_as`, which checks at run time. The compile-time `query_as!`
+/// cannot be used here — the timestamp expression is interpolated — so the
+/// guard is `the_audit_page_query_matches_the_schema` in rls_tests.rs.
+pub(crate) fn audit_page_sql() -> String {
+    format!(
+        "SELECT e.id, u.email, e.action, e.target_id, e.detail, {} \
+         FROM audit_events e LEFT JOIN users u ON u.id = e.actor_user_id \
+         WHERE e.org_id = $1 AND ($2::bigint IS NULL OR e.id < $2) \
+           AND ($4::text IS NULL OR e.action LIKE $4 || '%') \
+           AND ($5::text IS NULL OR u.email = $5) \
+           AND ($6::text IS NULL OR e.at >= $6::timestamptz) \
+           AND ($7::text IS NULL OR e.at <= $7::timestamptz) \
+         ORDER BY e.id DESC LIMIT $3",
+        rfc3339("e.at"),
+    )
+}
+
+/// Who did what, and when.
+///
+/// The table has been written to since 0001 and until now there was no way to
+/// read it — which made it a table, not an audit. An audit nobody can read is
+/// a compliance story rather than a feature, and for the agencies this product
+/// is for, "who opened that profile on Tuesday" is the question that gets asked
+/// after somebody leaves.
+///
+/// Owners and admins only. A member being able to see every action of every
+/// colleague is surveillance rather than accountability, and the roles already
+/// draw that line for `ManageAccess`.
+///
+/// Row-level security already confines this to the caller's organisation
+/// (`org_isolation ON audit_events`), and the `org_id = $1` below is the second
+/// lock rather than the first — every other handler here is written the same
+/// way, and the RLS work exists precisely because one of them was once wrong.
+///
+/// Orphaned rows — `org_id IS NULL`, left by migration 0007 when an
+/// organisation is deleted so the record of who did what outlives the tenant —
+/// are invisible here by construction: `user_in_org(NULL)` is false, and the
+/// explicit predicate does not match either. That is deliberate. They are for
+/// somebody with database access, which is the right audience for the history
+/// of a deleted organisation.
+async fn list_audit(
+    mut db: auth::Db,
+    Query(q): Query<AuditQuery>,
+) -> ApiResult<Json<Vec<AuditEntry>>> {
+    let caller = db.caller;
+
+    use fury_shared::rbac::OrgRole;
+    if !matches!(caller.role, OrgRole::Owner | OrgRole::Admin) {
+        return Err(ApiError::Denied(Perm::ManageAccess));
+    }
+
+    // Bounded, and bounded here rather than trusted from the query: a client
+    // asking for a million rows is a client that gets a timeout instead of an
+    // answer, and the operator reads it as the server being broken.
+    let limit = q.limit.unwrap_or(200).clamp(1, 1000);
+
+    let rows: Vec<(i64, Option<String>, String, Option<Uuid>, serde_json::Value, String)> =
+        sqlx::query_as(&audit_page_sql())
+        .bind(caller.org_id)
+        .bind(q.before)
+        .bind(limit)
+        .bind(q.action.filter(|s| !s.is_empty()))
+        .bind(q.actor.filter(|s| !s.is_empty()))
+        .bind(q.since.filter(|s| !s.is_empty()))
+        .bind(q.until.filter(|s| !s.is_empty()))
+        .fetch_all(db.as_mut())
+        .await?;
+
+    Ok(Json(
+        rows.into_iter()
+            .map(|(id, email, action, target_id, detail, at)| AuditEntry {
+                id,
+                // A deleted user leaves their rows behind — 0007 nulls the
+                // actor rather than removing the history. Naming them "someone
+                // who has left" beats an empty cell, which reads as a bug.
+                actor: email
+                    .unwrap_or_else(|| "(a user who has since been removed)".into()),
+                action,
+                target_id,
+                detail,
+                at,
+            })
+            .collect(),
+    ))
+}
+
+#[derive(serde::Deserialize)]
+struct AuditQuery {
+    limit: Option<i64>,
+    /// Page by id rather than by offset: rows arrive while somebody is
+    /// reading, and OFFSET would show them a row twice or not at all.
+    before: Option<i64>,
+    /// An action prefix: `profile.` for everything done to profiles,
+    /// `login.` for sign-in notices. The names are dotted for this.
+    action: Option<String>,
+    /// One member, by email.
+    actor: Option<String>,
+    /// RFC 3339 bounds.
+    since: Option<String>,
+    until: Option<String>,
+}
+
+#[derive(serde::Serialize)]
+struct AuditEntry {
+    id: i64,
+    actor: String,
+    action: String,
+    target_id: Option<Uuid>,
+    detail: serde_json::Value,
+    at: String,
+}
+
+/// One row of `list_proxies_sql`.
+pub(crate) type ProxyRow = (
+    Uuid, String, String, String, i32, Option<String>, Option<String>, Option<String>, i64,
+    Option<Uuid>, Option<String>,
+);
+
+/// The organisation's proxies, with who added each, as SQL. A function so a
+/// test runs the real query against the real schema.
+pub(crate) fn list_proxies_sql() -> String {
+    format!(
+        "SELECT x.id, x.name, x.kind::text, x.host, x.port, x.last_country, \
+                x.last_kind_detected, {}, \
+                (SELECT count(*) FROM profiles f WHERE f.proxy_id = x.id AND f.deleted_at IS NULL), \
+                x.created_by, u.email \
+         FROM proxies x LEFT JOIN users u ON u.id = x.created_by \
+         WHERE x.org_id = $1 AND x.deleted_at IS NULL \
+         ORDER BY x.name",
+        rfc3339("x.last_checked_at"),
+    )
+}
+
+/// The organisation's proxies, for the picker on a profile.
+///
+/// Never returns `credentials_enc`. Someone choosing which exit a profile uses
+/// needs to tell them apart, which is a name and a masked host; the sealed
+/// credentials are handed out once, bound to a lock, when a profile is actually
+/// launched.
+async fn list_proxies(
+    mut db: auth::Db,
+) -> ApiResult<Json<Vec<ProxySummary>>> {
+    // Copied out so that reading it does not borrow the connection: a
+    // handler needs both in the same expression constantly.
+    let caller = db.caller;
+
+    let reveal = caller.implicit_permissions().has(Perm::RevealSecrets);
+    let rows: Vec<ProxyRow> = sqlx::query_as(&list_proxies_sql())
+        .bind(caller.org_id)
+        .fetch_all(db.as_mut())
+        .await?;
+
+    // Who may change which, by the rule edit_proxy and delete_proxy enforce,
+    // so the list can say it instead of the Save button.
+    let implicit = fury_shared::rbac::has_implicit_project_access(caller.role);
+    let may_add = !implicit
+        && rbac_guard::may_add_proxies(db.as_mut(), caller.user_id, caller.org_id, caller.role).await?;
+
+    Ok(Json(
+        rows.into_iter()
+            .map(|(id, name, kind, host, port, country, detected, checked, used, author, author_email)| ProxySummary {
+                id,
+                name,
+                kind,
+                // The doc comment on ProxySummary promises host:port and the
+                // first version gave only the host, so a picker could not tell
+                // two ports on one gateway apart — which is how a provider
+                // sells fifty exits.
+                display: if reveal {
+                    format!("{host}:{port}")
+                } else {
+                    format!("{}:{port}", mask_host(&host))
+                },
+                country,
+                detected_kind: detected,
+                last_checked_at: checked,
+                shared_with_profiles: used,
+                added_by: author_email,
+                may_change: Some(
+                    rbac_guard::proxy_change(implicit, author == Some(caller.user_id), may_add)
+                        == rbac_guard::ProxyChange::Allowed,
+                ),
+            })
+            .collect(),
+    ))
+}
+
+/// Refuses machine settings that describe a machine that does not exist, in
+/// the words the shared validator uses, so the dialog can show them as they
+/// are. The agent checks again at launch; this is so nobody stores one.
+fn check_overrides(
+    overrides: &MachineOverrides,
+    persona: &fury_shared::Persona,
+    catalogue: &[fury_shared::Persona],
+) -> ApiResult<()> {
+    overrides.apply(persona, catalogue).map(|_| ()).map_err(|errs| {
+        ApiError::BadRequest(format!(
+            "these machine settings describe a machine that does not exist: {}",
+            errs.join("; ")
+        ))
+    })
+}
+
+#[derive(Deserialize)]
+pub struct NewProfileRequest {
+    name: String,
+    #[serde(default)]
+    tags: Vec<String>,
+    persona_id: String,
+    /// Sixteen lowercase hex characters. Generated by the client, because it is
+    /// the client that has to keep it stable for the life of the account.
+    fp_seed: String,
+    timezone: String,
+    languages: Vec<String>,
+    /// Required, and it stays required.
+    ///
+    /// The column allows NULL and this struct does not, which looks like an
+    /// oversight and is not: `launch_spec` refuses a profile with no proxy —
+    /// "launching without it would send traffic from the operator's own
+    /// address" — so a proxyless row here would be creatable, listable, and
+    /// dead at the moment a colleague needed it. That is the exact failure the
+    /// note above this struct exists to prevent, and it costs a colleague their
+    /// afternoon rather than costing us a validation error.
+    ///
+    /// The client says so before sending, so nobody meets this as a 422.
+    proxy_id: Uuid,
+    #[serde(default)]
+    start_urls: Vec<String>,
+    #[serde(default)]
+    notes: String,
+    #[serde(default)]
+    status: String,
+    #[serde(default)]
+    overrides: MachineOverrides,
+}
+
+/// Create a profile in a project.
+///
+/// Everything a launch needs is required here rather than defaulted. A profile
+/// that cannot be launched should not be creatable: the alternative is a row
+/// that looks fine in a list and fails at the moment someone needs it, which
+/// for a shared profile means failing on a colleague's machine.
+async fn create_profile(
+    State(state): State<Arc<AppState>>,
+    mut db: auth::Db,
+    Path(project_id): Path<Uuid>,
+    Json(req): Json<NewProfileRequest>,
+) -> ApiResult<Json<serde_json::Value>> {
+    // Copied out so that reading it does not borrow the connection: a
+    // handler needs both in the same expression constantly.
+    let caller = db.caller;
+
+    rbac_guard::require(db.as_mut(), caller.user_id, project_id, Perm::CreateProfile).await?;
+    ensure_room_for_a_profile(&mut db, &state.limits).await?;
+
+    if req.name.trim().is_empty() {
+        return Err(ApiError::BadRequest("a profile needs a name".into()));
+    }
+    let seed = fury_shared::persona::seed::from_hex(&req.fp_seed).ok_or_else(|| {
+        ApiError::BadRequest("fp_seed must be sixteen hex characters".into())
+    })?;
+    // An empty timezone or language list is now a decision rather than an
+    // omission: it means the profile follows its exit, and the agent resolves
+    // both from the address the proxy actually leaves through. That is the
+    // better default — a profile whose zone was pinned by hand months ago and
+    // whose proxy has since moved country is exactly the contradiction the zone
+    // was set to avoid.
+    //
+    // Stored as NULL and '{}' respectively, which is what launch_spec reads.
+    let catalogue = org_catalogue(db.as_mut(), caller.org_id).await?;
+    let Some(persona) = catalogue.iter().find(|p| p.id == req.persona_id) else {
+        return Err(ApiError::BadRequest(format!(
+            "no persona called {:?} — the client and the server ship different catalogues",
+            req.persona_id
+        )));
+    };
+    check_overrides(&req.overrides, persona, &catalogue)?;
+
+    // The proxy has to be one of ours, and it has to be usable: a profile
+    // pointing at a proxy whose credentials were never sealed is exactly the
+    // unlaunchable row this endpoint refuses to create.
+    let usable: Option<(bool,)> = sqlx::query_as(
+        "SELECT (credentials_enc IS NOT NULL AND wrapped_dek IS NOT NULL)          FROM proxies WHERE id = $1 AND org_id = $2 AND deleted_at IS NULL",
+    )
+    .bind(req.proxy_id)
+    .bind(caller.org_id)
+    .fetch_optional(db.as_mut())
+    .await?;
+    match usable {
+        None => return Err(ApiError::BadRequest("no such proxy".into())),
+        Some((false,)) => {
+            return Err(ApiError::BadRequest(
+                "that proxy has no stored credentials, so nothing could launch through it".into(),
+            ))
+        }
+        Some((true,)) => {}
+    }
+
+    let id = Uuid::now_v7();
+    sqlx::query(
+        "INSERT INTO profiles (id, org_id, project_id, name, notes, tags, persona_id, fp_seed,                                timezone, languages, proxy_id, start_urls, created_by, status, overrides)          VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)",
+    )
+    .bind(id)
+    .bind(caller.org_id)
+    .bind(project_id)
+    .bind(req.name.trim())
+    .bind(&req.notes)
+    .bind(&req.tags)
+    .bind(&req.persona_id)
+    .bind(fury_shared::persona::seed::to_bytes(seed).as_slice())
+    .bind(Some(req.timezone.trim()).filter(|t| !t.is_empty()))
+    .bind(&req.languages)
+    .bind(req.proxy_id)
+    .bind(&req.start_urls)
+    .bind(caller.user_id)
+    .bind(req.status.trim())
+    .bind(sqlx::types::Json(&req.overrides))
+    .execute(db.as_mut())
+    .await?;
+
+    audit(db.as_mut(), &caller, "profile.create", Some(id), json!({ "name": req.name })).await?;
+    Ok(Json(json!({ "id": id })))
+}
+
+#[derive(Deserialize)]
+pub struct CloneProfileRequest {
+    count: u32,
+    /// `{n}` is replaced by the copy's number. Absent means "<name> copy {n}".
+    #[serde(default)]
+    name: Option<String>,
+}
+
+/// Copy a profile's setup, never its identity.
+///
+/// Done here rather than in the client because the client does not have the
+/// profile: the listing carries a name, tags, persona and proxy, and not the
+/// timezone, languages, notes or start URLs. A copy assembled from the listing
+/// would be silently missing four fields somebody had set on purpose.
+///
+/// What is NOT copied is the seed. It drives the canvas, audio and geometry
+/// noise, so two profiles sharing one are byte-identical to any site that reads
+/// a canvas and the accounts are linked for as long as they exist. A fresh one
+/// per copy, generated here, is the whole point of the feature being a copy
+/// rather than a duplicate. The bundle is not copied either — cookies ARE the
+/// logged-in account, so a copy carrying them would be a second window on one
+/// account instead of a second account.
+/// A size somebody can act on.
+///
+/// Integer division made the first version of the storage refusal say "may
+/// store 1 MB and has 0 MB", which reads as a bug rather than as a full disk —
+/// the organisation had 700 KB. A refusal that looks wrong gets reported as a
+/// fault instead of acted on.
+fn human_bytes(n: i64) -> String {
+    const KB: i64 = 1024;
+    const MB: i64 = 1024 * KB;
+    const GB: i64 = 1024 * MB;
+    match n {
+        n if n >= GB => format!("{:.1} GB", n as f64 / GB as f64),
+        n if n >= MB => format!("{:.1} MB", n as f64 / MB as f64),
+        n if n >= KB => format!("{} KB", n / KB),
+        n => format!("{n} bytes"),
+    }
+}
+
+/// Room for one more profile in this organisation.
+///
+/// Called from every route that creates one — the dialog, the bulk maker, the
+/// clone — because a ceiling one route enforces is a ceiling with a way round
+/// it, and the way round is always the route somebody uses for two hundred at a
+/// time.
+///
+/// Deleted profiles do not count: they are in the trash, they are recoverable,
+/// and charging somebody for a profile they threw away would make the limit
+/// feel arbitrary.
+async fn ensure_room_for_a_profile(
+    db: &mut auth::Db,
+    limits: &crate::Limits,
+) -> Result<(), ApiError> {
+    ensure_room_for_profiles(db, limits, 1).await
+}
+
+async fn ensure_room_for_profiles(
+    db: &mut auth::Db,
+    limits: &crate::Limits,
+    wanted: i64,
+) -> Result<(), ApiError> {
+    let Some(max) = limits.max_profiles_per_org else { return Ok(()) };
+    let used: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM profiles WHERE org_id = $1 AND deleted_at IS NULL",
+    )
+    .bind(db.caller.org_id)
+    .fetch_one(db.as_mut())
+    .await?;
+    if used + wanted > max {
+        return Err(ApiError::BadRequest(format!(
+            "this organisation may hold {max} profiles and holds {used}; \
+             {wanted} more would not fit. Delete some, or ask whoever runs the \
+             server for more room"
+        )));
+    }
+    Ok(())
+}
+
+async fn clone_profile(
+    State(state): State<Arc<AppState>>,
+    mut db: auth::Db,
+    Path(profile_id): Path<Uuid>,
+    Json(req): Json<CloneProfileRequest>,
+) -> ApiResult<Json<serde_json::Value>> {
+    // Copied out so that reading it does not borrow the connection: a
+    // handler needs both in the same expression constantly.
+    let caller = db.caller;
+
+    if !(1..=500).contains(&req.count) {
+        return Err(ApiError::BadRequest("count must be between 1 and 500".into()));
+    }
+    // For all of them, not for one. A clone of five hundred is the route that
+    // would otherwise walk straight past a ceiling checked one profile at a
+    // time.
+    ensure_room_for_profiles(&mut db, &state.limits, req.count as i64).await?;
+
+    #[derive(sqlx::FromRow)]
+    struct Row {
+        project_id: Uuid,
+        name: String,
+        notes: String,
+        tags: Vec<String>,
+        persona_id: String,
+        timezone: Option<String>,
+        languages: Vec<String>,
+        proxy_id: Option<Uuid>,
+        start_urls: Vec<String>,
+        overrides: sqlx::types::Json<MachineOverrides>,
+    }
+
+    let source: Row = sqlx::query_as(
+        "SELECT project_id, name, notes, tags, persona_id, timezone, languages, proxy_id, \
+                start_urls, overrides \
+         FROM profiles WHERE id = $1 AND org_id = $2 AND deleted_at IS NULL",
+    )
+    .bind(profile_id)
+    .bind(caller.org_id)
+    .fetch_optional(db.as_mut())
+    .await?
+    .ok_or(ApiError::NotFound)?;
+
+    // Creating, not editing: the permission that matters is the one for adding
+    // a profile to the project the copies land in.
+    rbac_guard::require(db.as_mut(), caller.user_id, source.project_id, Perm::CreateProfile).await?;
+
+    let pattern = match req.name.as_deref().map(str::trim).filter(|n| !n.is_empty()) {
+        Some(n) if n.contains("{n}") => n.to_string(),
+        Some(n) => format!("{n} {{n}}"),
+        None => format!("{} copy {{n}}", source.name),
+    };
+
+    let mut created = Vec::new();
+    for i in 1..=req.count {
+        let id = Uuid::now_v7();
+        let seed: u64 = {
+            use rand::Rng;
+            rand::thread_rng().gen()
+        };
+        sqlx::query(
+            "INSERT INTO profiles (id, org_id, project_id, name, notes, tags, persona_id, \
+                                   fp_seed, timezone, languages, proxy_id, start_urls, created_by, \
+                                   overrides) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)",
+        )
+        .bind(id)
+        .bind(caller.org_id)
+        .bind(source.project_id)
+        .bind(pattern.replace("{n}", &i.to_string()))
+        .bind(&source.notes)
+        .bind(&source.tags)
+        .bind(&source.persona_id)
+        .bind(fury_shared::persona::seed::to_bytes(seed).as_slice())
+        .bind(source.timezone.as_deref())
+        .bind(&source.languages)
+        .bind(source.proxy_id)
+        .bind(&source.start_urls)
+        .bind(caller.user_id)
+        .bind(&source.overrides)
+        .execute(db.as_mut())
+        .await?;
+        created.push(id);
+    }
+
+    audit(
+        db.as_mut(),
+        &caller,
+        "profile.clone",
+        Some(profile_id),
+        json!({ "count": req.count }),
+    )
+    .await?;
+    Ok(Json(json!({ "created": created })))
+}
+
+#[derive(Deserialize)]
+pub struct EditProxyRequest {
+    name: String,
+    kind: String,
+    host: String,
+    port: i32,
+    /// Present only when the credentials changed. Absent leaves the stored ones
+    /// alone, so renaming a proxy does not require the organisation key.
+    #[serde(default)]
+    credentials_enc: Option<String>,
+    #[serde(default)]
+    wrapped_dek: Option<String>,
+}
+
+/// Change a proxy.
+///
+/// The credentials are optional, and that is the useful part: renaming an exit
+/// or correcting its port is an everyday edit, and requiring the organisation
+/// key for it would mean a manager cannot fix a typo. Supplying them replaces
+/// both halves together — a `credentials_enc` under one data key with a
+/// `wrapped_dek` for another is a proxy that opens nowhere.
+async fn edit_proxy(
+    mut db: auth::Db,
+    Path(proxy_id): Path<Uuid>,
+    Json(req): Json<EditProxyRequest>,
+) -> ApiResult<Json<serde_json::Value>> {
+    // Copied out so that reading it does not borrow the connection: a
+    // handler needs both in the same expression constantly.
+    let caller = db.caller;
+
+    match rbac_guard::may_change_proxy(db.as_mut(), caller.user_id, caller.org_id, caller.role, proxy_id).await? {
+        None => return Err(ApiError::NotFound),
+        Some(rbac_guard::ProxyChange::NotTheirs) => return Err(ApiError::Refused("proxy_not_yours")),
+        Some(rbac_guard::ProxyChange::NoLongerPermitted) => return Err(ApiError::Denied(Perm::EditProxy)),
+        Some(rbac_guard::ProxyChange::Allowed) => {}
+    }
+    if !matches!(req.kind.as_str(), "http" | "https" | "socks5" | "wireguard") {
+        return Err(ApiError::BadRequest("kind must be http, https, socks5 or wireguard".into()));
+    }
+    if !(1..=65535).contains(&req.port) || req.host.trim().is_empty() {
+        return Err(ApiError::BadRequest("a proxy needs a host and a port".into()));
+    }
+
+    // Someone without `reveal_secrets` is shown the host masked, and the form
+    // sends back what it showed. Written, it turned a renamed proxy into one
+    // that dials "***1a2b.provider.net". The mask of the stored host means
+    // "unchanged".
+    let stored_host: Option<String> =
+        sqlx::query_scalar("SELECT host FROM proxies WHERE id = $1 AND org_id = $2 AND deleted_at IS NULL")
+            .bind(proxy_id)
+            .bind(caller.org_id)
+            .fetch_optional(db.as_mut())
+            .await?;
+    let host = match stored_host {
+        Some(stored) if req.host.trim() == mask_host(&stored) => stored,
+        _ => req.host.trim().to_string(),
+    };
+
+    let credentials = match (&req.credentials_enc, &req.wrapped_dek) {
+        (Some(c), Some(d)) => {
+            let c = unhex("credentials_enc", c)?;
+            let d = unhex("wrapped_dek", d)?;
+            if c.len() < 40 || d.len() < 40 {
+                return Err(ApiError::BadRequest(
+                    "credentials_enc and wrapped_dek must be sealed values".into(),
+                ));
+            }
+            Some((c, d))
+        }
+        (None, None) => None,
+        _ => {
+            return Err(ApiError::BadRequest(
+                "credentials_enc and wrapped_dek travel together or not at all".into(),
+            ))
+        }
+    };
+
+    let updated = match credentials {
+        Some((c, d)) => {
+            sqlx::query(
+                "UPDATE proxies SET name = $1, kind = $2::proxy_kind, host = $3, port = $4, \
+                        credentials_enc = $5, wrapped_dek = $6 \
+                 WHERE id = $7 AND org_id = $8 AND deleted_at IS NULL",
+            )
+            .bind(req.name.trim())
+            .bind(&req.kind)
+            .bind(&host)
+            .bind(req.port)
+            .bind(&c)
+            .bind(&d)
+            .bind(proxy_id)
+            .bind(caller.org_id)
+            .execute(db.as_mut())
+            .await?
+        }
+        None => {
+            sqlx::query(
+                "UPDATE proxies SET name = $1, kind = $2::proxy_kind, host = $3, port = $4 \
+                 WHERE id = $5 AND org_id = $6 AND deleted_at IS NULL",
+            )
+            .bind(req.name.trim())
+            .bind(&req.kind)
+            .bind(&host)
+            .bind(req.port)
+            .bind(proxy_id)
+            .bind(caller.org_id)
+            .execute(db.as_mut())
+            .await?
+        }
+    };
+    if updated.rows_affected() == 0 {
+        return Err(ApiError::NotFound);
+    }
+
+    audit(db.as_mut(), &caller, "proxy.edit", Some(proxy_id),
+          json!({ "credentials_changed": req.credentials_enc.is_some() })).await?;
+    Ok(Json(json!({ "ok": true })))
+}
+
+/// Hand over one proxy's sealed credentials.
+///
+/// Everywhere else, ciphertext is released only as part of taking a lock, so
+/// that every handout is already recorded as a launch. Checking a proxy is the
+/// exception that has to exist — an operator must be able to ask "does this
+/// exit still work" without opening a profile — so it is its own permission and
+/// its own audit line rather than a quiet reuse of something else.
+///
+/// Still ciphertext. The server has never held the plaintext and does not here.
+async fn reveal_proxy(
+    mut db: auth::Db,
+    Path(proxy_id): Path<Uuid>,
+) -> ApiResult<Json<serde_json::Value>> {
+    // Copied out so that reading it does not borrow the connection: a
+    // handler needs both in the same expression constantly.
+    let caller = db.caller;
+
+    if !caller.implicit_permissions().has(Perm::RevealSecrets) {
+        return Err(ApiError::Denied(Perm::RevealSecrets));
+    }
+
+    let row: Option<(String, String, i32, Option<Vec<u8>>, Option<Vec<u8>>)> = sqlx::query_as(
+        "SELECT kind::text, host, port, credentials_enc, wrapped_dek \
+         FROM proxies WHERE id = $1 AND org_id = $2 AND deleted_at IS NULL",
+    )
+    .bind(proxy_id)
+    .bind(caller.org_id)
+    .fetch_optional(db.as_mut())
+    .await?;
+
+    let (kind, host, port, credentials_enc, wrapped_dek) = row.ok_or(ApiError::NotFound)?;
+    let (Some(credentials_enc), Some(wrapped_dek)) = (credentials_enc, wrapped_dek) else {
+        return Err(ApiError::BadRequest(
+            "this proxy has no stored credentials".into(),
+        ));
+    };
+
+    audit(db.as_mut(), &caller, "proxy.reveal", Some(proxy_id), json!({})).await?;
+
+    let hex = |v: &[u8]| v.iter().map(|b| format!("{b:02x}")).collect::<String>();
+    Ok(Json(json!({
+        "kind": kind,
+        "host": host,
+        "port": port,
+        "credentials_enc": hex(&credentials_enc),
+        "wrapped_dek": hex(&wrapped_dek),
+    })))
+}
+
+/// Retire a proxy.
+///
+/// Soft, and the profiles that used it keep working until someone gives them
+/// another — `ON DELETE SET NULL`, because a warmed account is worth more than
+/// the exit it happened to go out through. They will refuse to launch, with a
+/// sentence saying why, which is the correct amount of stopping.
+async fn delete_proxy(
+    mut db: auth::Db,
+    Path(proxy_id): Path<Uuid>,
+) -> ApiResult<Json<serde_json::Value>> {
+    // Copied out so that reading it does not borrow the connection: a
+    // handler needs both in the same expression constantly.
+    let caller = db.caller;
+
+    match rbac_guard::may_change_proxy(db.as_mut(), caller.user_id, caller.org_id, caller.role, proxy_id).await? {
+        None => return Err(ApiError::NotFound),
+        Some(rbac_guard::ProxyChange::NotTheirs) => return Err(ApiError::Refused("proxy_not_yours")),
+        Some(rbac_guard::ProxyChange::NoLongerPermitted) => return Err(ApiError::Denied(Perm::EditProxy)),
+        Some(rbac_guard::ProxyChange::Allowed) => {}
+    }
+    let used: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM profiles WHERE proxy_id = $1 AND deleted_at IS NULL",
+    )
+    .bind(proxy_id)
+    .fetch_one(db.as_mut())
+    .await?;
+
+    let updated = sqlx::query(
+        "UPDATE proxies SET deleted_at = now() \
+         WHERE id = $1 AND org_id = $2 AND deleted_at IS NULL",
+    )
+    .bind(proxy_id)
+    .bind(caller.org_id)
+    .execute(db.as_mut())
+    .await?;
+    if updated.rows_affected() == 0 {
+        return Err(ApiError::NotFound);
+    }
+
+    audit(db.as_mut(), &caller, "proxy.delete", Some(proxy_id), json!({ "profiles": used })).await?;
+    Ok(Json(json!({ "deleted": true, "profiles_left_without_a_proxy": used })))
+}
+
+#[derive(Deserialize)]
+pub struct EditProfileRequest {
+    name: String,
+    #[serde(default)]
+    notes: String,
+    #[serde(default)]
+    tags: Vec<String>,
+    timezone: String,
+    languages: Vec<String>,
+    proxy_id: Uuid,
+    #[serde(default)]
+    start_urls: Vec<String>,
+    #[serde(default)]
+    status: String,
+    /// `None` leaves them as they are, so a client from before 0.2.0 that has
+    /// never heard of them cannot wipe them by saving a name.
+    #[serde(default)]
+    overrides: Option<MachineOverrides>,
+}
+
+/// Change a profile. Never its persona or its seed.
+///
+/// Those two are the machine the account has been seen on, and changing them is
+/// not an edit — it is telling a site that a device it has known for months has
+/// been replaced. Nothing in this API can do it, which is why there is no field
+/// for it here rather than a check that rejects one.
+async fn edit_profile(
+    mut db: auth::Db,
+    Path(profile_id): Path<Uuid>,
+    Json(req): Json<EditProfileRequest>,
+) -> ApiResult<Json<serde_json::Value>> {
+    // Copied out so that reading it does not borrow the connection: a
+    // handler needs both in the same expression constantly.
+    let caller = db.caller;
+
+    let perms = rbac_guard::permissions_for_profile(db.as_mut(), caller.user_id, profile_id).await?;
+    if perms == PermSet::NONE {
+        return Err(ApiError::NotFound);
+    }
+    if !perms.has(Perm::EditProfile) {
+        return Err(ApiError::Denied(Perm::EditProfile));
+    }
+
+    if req.name.trim().is_empty() {
+        return Err(ApiError::BadRequest("a profile needs a name".into()));
+    }
+    // Empty means "follow the exit" here too — clearing the field is how an
+    // operator hands the decision back to the proxy. See create_profile.
+
+    // Changing which exit a profile uses is its own permission: it is the one
+    // edit that changes where the account appears to be.
+    let (current, persona_id, current_overrides): (Option<Uuid>, String, sqlx::types::Json<MachineOverrides>) =
+        sqlx::query_as("SELECT proxy_id, persona_id, overrides FROM profiles WHERE id = $1")
+            .bind(profile_id)
+            .fetch_one(db.as_mut())
+            .await?;
+    if current != Some(req.proxy_id) && !perms.has(Perm::EditProxy) {
+        return Err(ApiError::Denied(Perm::EditProxy));
+    }
+
+    // The machine's fields are the fingerprint, and changing them is the
+    // permission for that rather than for renaming a profile. Only asked when
+    // they actually change, so somebody without it can still edit the notes of
+    // a profile that has overrides.
+    let overrides = req.overrides.clone().unwrap_or_else(|| current_overrides.0.clone());
+    if overrides != current_overrides.0 {
+        if !perms.has(Perm::EditFingerprint) {
+            return Err(ApiError::Denied(Perm::EditFingerprint));
+        }
+        let catalogue = org_catalogue(db.as_mut(), caller.org_id).await?;
+        let persona = catalogue.iter().find(|p| p.id == persona_id).ok_or_else(|| {
+            ApiError::BadRequest(format!(
+                "this profile's machine {persona_id:?} is not in this server's catalogue"
+            ))
+        })?;
+        check_overrides(&overrides, persona, &catalogue)?;
+    }
+
+    let usable: Option<(bool,)> = sqlx::query_as(
+        "SELECT (credentials_enc IS NOT NULL AND wrapped_dek IS NOT NULL) \
+         FROM proxies WHERE id = $1 AND org_id = $2 AND deleted_at IS NULL",
+    )
+    .bind(req.proxy_id)
+    .bind(caller.org_id)
+    .fetch_optional(db.as_mut())
+    .await?;
+    match usable {
+        None => return Err(ApiError::BadRequest("no such proxy".into())),
+        Some((false,)) => {
+            return Err(ApiError::BadRequest(
+                "that proxy has no stored credentials, so nothing could launch through it".into(),
+            ))
+        }
+        Some((true,)) => {}
+    }
+
+    sqlx::query(
+        "UPDATE profiles SET name = $1, notes = $2, tags = $3, timezone = $4, \
+                             languages = $5, proxy_id = $6, start_urls = $7, status = $9, \
+                             overrides = $10 \
+         WHERE id = $8 AND deleted_at IS NULL",
+    )
+    .bind(req.name.trim())
+    .bind(&req.notes)
+    .bind(&req.tags)
+    .bind(Some(req.timezone.trim()).filter(|t| !t.is_empty()))
+    .bind(&req.languages)
+    .bind(req.proxy_id)
+    .bind(&req.start_urls)
+    .bind(profile_id)
+    .bind(req.status.trim())
+    .bind(sqlx::types::Json(&overrides))
+    .execute(db.as_mut())
+    .await?;
+
+    audit(db.as_mut(), &caller, "profile.edit", Some(profile_id), json!({ "name": req.name })).await?;
+    Ok(Json(json!({ "ok": true })))
+}
+
+/// Send a profile to the trash.
+///
+/// Soft, always. A profile holds a warmed account, and the difference between
+/// hiding one and destroying one must never be a single click — the same rule
+/// the local store follows. Refused while it is open: a browser closing after
+/// this would push a bundle into a profile nobody can find.
+async fn delete_profile(
+    mut db: auth::Db,
+    Path(profile_id): Path<Uuid>,
+) -> ApiResult<Json<serde_json::Value>> {
+    // Copied out so that reading it does not borrow the connection: a
+    // handler needs both in the same expression constantly.
+    let caller = db.caller;
+
+    let perms = rbac_guard::permissions_for_profile(db.as_mut(), caller.user_id, profile_id).await?;
+    if perms == PermSet::NONE {
+        return Err(ApiError::NotFound);
+    }
+    if !perms.has(Perm::DeleteProfile) {
+        return Err(ApiError::Denied(Perm::DeleteProfile));
+    }
+
+    let open: bool = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM profile_locks WHERE profile_id = $1 AND expires_at > now())",
+    )
+    .bind(profile_id)
+    .fetch_one(db.as_mut())
+    .await?;
+    if open {
+        return Err(ApiError::Conflict(
+            "this profile is open right now. Close it first — a browser closing after it was \
+             deleted would save into a profile nobody can find"
+                .into(),
+        ));
+    }
+
+    let updated = sqlx::query("UPDATE profiles SET deleted_at = now() WHERE id = $1 AND deleted_at IS NULL")
+        .bind(profile_id)
+        .execute(db.as_mut())
+        .await?;
+    if updated.rows_affected() == 0 {
+        return Err(ApiError::NotFound);
+    }
+
+    audit(db.as_mut(), &caller, "profile.delete", Some(profile_id), json!({})).await?;
+    Ok(Json(json!({ "deleted": true })))
+}
+
+#[derive(Deserialize)]
+pub struct MoveRequest {
+    ids: Vec<Uuid>,
+    /// Where they land. Required: on a server a profile always belongs to a
+    /// project, because the project is what carries access to it — a profile
+    /// outside every project would be one nobody has any stated right to open.
+    project_id: Uuid,
+}
+
+/// Move profiles into another project.
+///
+/// Two permissions, not one, and they are on different projects. Taking a
+/// profile out of a project removes it from everyone who could reach it there,
+/// which is `delete_profile` on the source; putting it into another makes it
+/// reachable by everyone who can reach that one, which is `create_profile` on
+/// the destination. Checking only the destination would let anyone who can
+/// create a profile anywhere quietly move somebody else's work into a project
+/// only they can see.
+async fn move_profiles(
+    mut db: auth::Db,
+    Json(req): Json<MoveRequest>,
+) -> ApiResult<Json<serde_json::Value>> {
+    // Copied out so that reading it does not borrow the connection: a
+    // handler needs both in the same expression constantly.
+    let caller = db.caller;
+
+    if req.ids.is_empty() {
+        return Ok(Json(json!({ "moved": 0 })));
+    }
+    rbac_guard::require(db.as_mut(), caller.user_id, req.project_id, Perm::CreateProfile).await?;
+
+    let mut tx = db.begin().await?;
+    let mut moved = 0;
+
+    for id in &req.ids {
+        let row: Option<(Uuid, bool)> = sqlx::query_as(
+            "SELECT f.project_id, \
+                    EXISTS(SELECT 1 FROM profile_locks l \
+                            WHERE l.profile_id = f.id AND l.expires_at > now()) \
+             FROM profiles f \
+             WHERE f.id = $1 AND f.org_id = $2 AND f.deleted_at IS NULL",
+        )
+        .bind(id)
+        .bind(caller.org_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+
+        let Some((from, open)) = row else {
+            return Err(ApiError::NotFound);
+        };
+        if from == req.project_id {
+            continue;
+        }
+        if open {
+            // Mid-session, the set of people who can reach this profile would
+            // change under the person using it — and the bundle they push on
+            // close would land in a project they were never granted.
+            return Err(ApiError::Conflict(
+                "one of these profiles is open right now. Close it first".into(),
+            ));
+        }
+
+        // Resolved against the source project each time rather than once: a
+        // selection can span projects, and a caller with rights on one of them
+        // must not carry those rights to the rest.
+        let perms = rbac_guard::permissions_for(&mut *tx, caller.user_id, from).await?;
+        if !perms.has(Perm::DeleteProfile) {
+            return Err(ApiError::Denied(Perm::DeleteProfile));
+        }
+
+        sqlx::query("UPDATE profiles SET project_id = $1 WHERE id = $2")
+            .bind(req.project_id)
+            .bind(id)
+            .execute(&mut *tx)
+            .await?;
+        moved += 1;
+    }
+
+    tx.commit().await?;
+    audit(db.as_mut(), &caller, "profile.move", Some(req.project_id),
+          json!({ "profiles": req.ids, "moved": moved })).await?;
+    Ok(Json(json!({ "moved": moved })))
+}
+
+/// Deleted profiles the caller may see.
+///
+/// Deletion is soft everywhere in this product for one reason: a profile holds
+/// an account that took months to warm, and the difference between hiding one
+/// and destroying one must never be a single click.
+async fn list_trash(
+    mut db: auth::Db,
+) -> ApiResult<Json<serde_json::Value>> {
+    // Copied out so that reading it does not borrow the connection: a
+    // handler needs both in the same expression constantly.
+    let caller = db.caller;
+
+    let rows: Vec<(Uuid, Uuid, String, String, Vec<String>, String, String)> =
+        sqlx::query_as(&format!(
+            "SELECT f.id, f.project_id, p.name, f.name, f.tags, f.persona_id, {} \
+             FROM profiles f \
+             JOIN projects p ON p.id = f.project_id \
+             JOIN org_members m ON m.org_id = p.org_id AND m.user_id = $1 \
+             LEFT JOIN project_grants g ON g.project_id = p.id AND g.user_id = $1 \
+                    AND (g.expires_at IS NULL OR g.expires_at > now()) \
+             WHERE f.deleted_at IS NOT NULL AND ($2 OR g.permissions IS NOT NULL) \
+             ORDER BY f.deleted_at DESC",
+            rfc3339("f.deleted_at"),
+        ))
+        .bind(caller.user_id)
+        .bind(fury_shared::rbac::has_implicit_project_access(caller.role))
+        .fetch_all(db.as_mut())
+        .await?;
+
+    Ok(Json(json!(rows
+        .into_iter()
+        .map(|(id, project_id, project_name, name, tags, persona_id, deleted_at)| json!({
+            "id": id,
+            "project_id": project_id,
+            "project_name": project_name,
+            "name": name,
+            "tags": tags,
+            "persona_id": persona_id,
+            "fp_seed": 0,
+            "proxy": serde_json::Value::Null,
+            // The trash answers "when did this go", not "when did it last run".
+            "last_opened_at": deleted_at,
+            "running": false,
+        }))
+        .collect::<Vec<_>>())))
+}
+
+async fn restore_profile(
+    mut db: auth::Db,
+    Path(profile_id): Path<Uuid>,
+) -> ApiResult<Json<serde_json::Value>> {
+    // Copied out so that reading it does not borrow the connection: a
+    // handler needs both in the same expression constantly.
+    let caller = db.caller;
+
+    // Resolved against the deleted row, which permissions_for_profile cannot
+    // see — it filters deleted profiles, as every other caller needs it to.
+    let project: Option<(Uuid,)> = sqlx::query_as("SELECT project_id FROM profiles WHERE id = $1")
+        .bind(profile_id)
+        .fetch_optional(db.as_mut())
+        .await?;
+    let (project_id,) = project.ok_or(ApiError::NotFound)?;
+    rbac_guard::require(db.as_mut(), caller.user_id, project_id, Perm::DeleteProfile).await?;
+
+    // Into a project that still exists, or nowhere useful. A profile restored
+    // into a deleted project is invisible again, which is the state the trash
+    // exists to get it out of.
+    let alive: bool = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM projects WHERE id = $1 AND deleted_at IS NULL)",
+    )
+    .bind(project_id)
+    .fetch_one(db.as_mut())
+    .await?;
+    if !alive {
+        return Err(ApiError::BadRequest(
+            "the project this profile was in has been deleted. Restore the project first"
+                .into(),
+        ));
+    }
+
+    sqlx::query("UPDATE profiles SET deleted_at = NULL WHERE id = $1")
+        .bind(profile_id)
+        .execute(db.as_mut())
+        .await?;
+    audit(db.as_mut(), &caller, "profile.restore", Some(profile_id), json!({})).await?;
+    Ok(Json(json!({ "restored": true })))
+}
+
+/// Gone for good: the row, and every bundle stored for it.
+async fn purge_profile(
+    mut db: auth::Db,
+    headers: HeaderMap,
+    Path(profile_id): Path<Uuid>,
+) -> ApiResult<Json<serde_json::Value>> {
+    // Copied out so that reading it does not borrow the connection: a
+    // handler needs both in the same expression constantly.
+    let caller = db.caller;
+    // Cannot be undone, so the organisation may ask for a fresh code first.
+    crate::security::require_step_up(db.as_mut(), &caller, &headers).await?;
+
+    let project: Option<(Uuid,)> = sqlx::query_as("SELECT project_id FROM profiles WHERE id = $1")
+        .bind(profile_id)
+        .fetch_optional(db.as_mut())
+        .await?;
+    let (project_id,) = project.ok_or(ApiError::NotFound)?;
+    rbac_guard::require(db.as_mut(), caller.user_id, project_id, Perm::DeleteProfile).await?;
+
+    // The bytes go first. A row deleted while its bundles stay is a directory
+    // of live cookie jars for a profile the operator believes is destroyed —
+    // the opposite of what emptying a trash means.
+    let dir = bundle_root().join(profile_id.to_string());
+    if dir.exists() {
+        std::fs::remove_dir_all(&dir).map_err(|e| {
+            ApiError::Internal(anyhow::anyhow!("could not remove {}: {e}", dir.display()))
+        })?;
+    }
+    sqlx::query("DELETE FROM profiles WHERE id = $1 AND deleted_at IS NOT NULL")
+        .bind(profile_id)
+        .execute(db.as_mut())
+        .await?;
+
+    audit(db.as_mut(), &caller, "profile.purge", Some(profile_id), json!({})).await?;
+    Ok(Json(json!({ "purged": true })))
+}
+
+// ---------------------------------------------------------------------------
+// the organisation
+// ---------------------------------------------------------------------------
+
+/// Everyone in the organisation, and whether they can actually decrypt anything.
+///
+/// `has_key` is the distinction that matters and the one nothing else surfaces:
+/// enrolling makes an account, but until someone wraps the organisation key to
+/// that person's public key they can sign in, see the team, and open nothing.
+/// `public_key` is here because wrapping it is the client's job — the server
+/// has never held the key it would need.
+async fn list_members(
+    State(state): State<Arc<AppState>>,
+    caller: Caller,
+) -> ApiResult<Json<serde_json::Value>> {
+    let rows: Vec<(Uuid, String, String, Vec<u8>, Option<Vec<u8>>, String)> =
+        sqlx::query_as(&format!(
+            "SELECT u.id, u.email, m.role::text, u.public_key, m.wrapped_ork, {} \
+             FROM org_members m JOIN users u ON u.id = m.user_id \
+             WHERE m.org_id = $1 AND u.disabled_at IS NULL \
+             ORDER BY m.joined_at",
+            rfc3339("m.joined_at"),
+        ))
+        .bind(caller.org_id)
+        .fetch_all(&state.db)
+        .await?;
+
+    use base64::Engine;
+    let b64 = |v: &[u8]| base64::engine::general_purpose::STANDARD.encode(v);
+
+    // Pending invitations are part of the picture: an owner who cannot see that
+    // they already invited someone issues a second code and wonders why.
+    let pending: Vec<(String, String, String)> = sqlx::query_as(&format!(
+        "SELECT email, role::text, {} FROM enrollments \
+         WHERE org_id = $1 AND used_at IS NULL AND expires_at > now() ORDER BY created_at",
+        rfc3339("expires_at"),
+    ))
+    .bind(caller.org_id)
+    .fetch_all(&state.db)
+    .await?;
+
+    Ok(Json(json!({
+        "members": rows.iter().map(|(id, email, role, pk, ork, joined)| json!({
+            "user_id": id,
+            "email": email,
+            "role": role,
+            "public_key": b64(pk),
+            "has_key": ork.is_some(),
+            "joined_at": joined,
+            "is_you": *id == caller.user_id,
+        })).collect::<Vec<_>>(),
+        "invited": pending.iter().map(|(email, role, expires)| json!({
+            "email": email, "role": role, "expires_at": expires,
+        })).collect::<Vec<_>>(),
+    })))
+}
+
+#[derive(Deserialize)]
+pub struct InviteRequest {
+    email: String,
+    role: String,
+}
+
+/// Invite someone, from the application rather than from a shell on the server.
+///
+/// The command-line form still exists and is the only way to create the first
+/// owner — there is nobody to invite them. Everything after that happens here,
+/// because asking an operator to ssh into a box to add a colleague is asking
+/// them not to.
+async fn create_invitation(
+    mut db: auth::Db,
+    Json(req): Json<InviteRequest>,
+) -> ApiResult<Json<serde_json::Value>> {
+    let caller = db.caller;
+
+    use fury_shared::rbac::OrgRole;
+    if !matches!(caller.role, OrgRole::Owner | OrgRole::Admin) {
+        return Err(ApiError::Denied(Perm::ManageAccess));
+    }
+    let role = auth::parse_role(&req.role)
+        .ok_or_else(|| ApiError::BadRequest("unknown role".into()))?;
+    // One owner per organisation: the key hierarchy has no story for two, and a
+    // second would be a person nobody can remove.
+    if matches!(role, OrgRole::Owner) {
+        return Err(ApiError::BadRequest(
+            "an organisation has one owner. Invite as admin for the same reach".into(),
+        ));
+    }
+    // An admin cannot mint another admin: it would let anyone who reaches one
+    // admin account grant themselves a second, and removing the first would no
+    // longer remove the access.
+    if matches!(caller.role, OrgRole::Admin) && matches!(role, OrgRole::Admin) {
+        return Err(ApiError::Denied(Perm::ManageAccess));
+    }
+
+    let email = req.email.trim();
+    if !email.contains('@') || email.len() < 3 {
+        return Err(ApiError::BadRequest("that is not an email address".into()));
+    }
+
+    let exists: bool = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM users u JOIN org_members m ON m.user_id = u.id \
+         WHERE u.email = $1 AND m.org_id = $2)",
+    )
+    .bind(email)
+    .bind(caller.org_id)
+    .fetch_one(db.as_mut())
+    .await?;
+    if exists {
+        return Err(ApiError::BadRequest(format!("{email} is already in this team")));
+    }
+
+    let code = crate::enroll::issue(
+        db.as_mut(),
+        email,
+        crate::enroll::Org::Existing(caller.org_id),
+        &req.role,
+    )
+    .await
+    .map_err(ApiError::Internal)?;
+
+    audit(db.as_mut(), &caller, "member.invite", None, json!({ "email": email, "role": req.role })).await?;
+
+    // Shown once. The row holds a hash, so this is the only time it exists.
+    Ok(Json(json!({
+        "code": code,
+        "expires_in_hours": crate::enroll::TTL_HOURS,
+    })))
+}
+
+#[derive(Deserialize)]
+pub struct HandOverRequest {
+    /// The organisation key, sealed to this member's public key by a client
+    /// that holds it. base64.
+    wrapped_ork: String,
+}
+
+/// Let a member in.
+///
+/// The second half of an invitation, and the half that cannot happen on the
+/// server: the organisation key is sealed to the member's public key by someone
+/// who already holds it, on their own machine. Until this runs, the member has
+/// an account and no ability to decrypt a single profile.
+async fn hand_over_key(
+    mut db: auth::Db,
+    Path(user_id): Path<Uuid>,
+    Json(req): Json<HandOverRequest>,
+) -> ApiResult<Json<serde_json::Value>> {
+    let caller = db.caller;
+
+    use fury_shared::rbac::OrgRole;
+    if !matches!(caller.role, OrgRole::Owner | OrgRole::Admin) {
+        return Err(ApiError::Denied(Perm::ManageAccess));
+    }
+
+    use base64::Engine;
+    let wrapped = base64::engine::general_purpose::STANDARD
+        .decode(&req.wrapped_ork)
+        .map_err(|_| ApiError::BadRequest("wrapped_ork is not base64".into()))?;
+    // 32 ephemeral public key + 24 nonce + 32 payload + 16 tag. Shorter cannot
+    // be a sealed key, and storing one would fail on the member's machine at
+    // sign-in with nothing to point at.
+    if wrapped.len() < 104 {
+        return Err(ApiError::BadRequest(
+            "that is not a sealed organisation key".into(),
+        ));
+    }
+
+    // Scoped to the caller's own organisation, and to the generation in force.
+    // Without the org clause an admin of one team could write a key into
+    // another team's membership row.
+    let generation: i32 = sqlx::query_scalar("SELECT ork_generation FROM organizations WHERE id = $1")
+        .bind(caller.org_id)
+        .fetch_one(db.as_mut())
+        .await?;
+
+    let updated = sqlx::query(
+        "UPDATE org_members SET wrapped_ork = $1, ork_generation = $2 \
+         WHERE org_id = $3 AND user_id = $4",
+    )
+    .bind(&wrapped)
+    .bind(generation)
+    .bind(caller.org_id)
+    .bind(user_id)
+    .execute(db.as_mut())
+    .await?;
+
+    if updated.rows_affected() == 0 {
+        return Err(ApiError::NotFound);
+    }
+
+    audit(db.as_mut(), &caller, "member.key", None, json!({ "target": user_id })).await?;
+    Ok(Json(json!({ "ok": true })))
+}
+
+#[derive(Deserialize)]
+pub struct RoleRequest {
+    role: String,
+}
+
+/// Change what a member is: admin, manager or member.
+///
+/// There was no way to do this at all, so somebody invited as an admin by
+/// mistake could only be removed -- a key rotation for the whole team -- and
+/// invited again. A tester met it on 01.10.2026: a colleague invited to one
+/// project saw every project, and being an admin was one of the two reasons.
+///
+/// The same lines as an invitation, for the same reasons: one owner, whose
+/// role this does not touch; an admin cannot make another admin, and cannot
+/// change one either, or two admin accounts could take turns demoting each
+/// other and removing the first would no longer remove the access. Nobody
+/// changes their own role. Promoting to admin opens every project in the
+/// organisation, so it asks for a fresh code when the organisation asks for
+/// one on sensitive actions.
+///
+/// Grants are left as they are. A demoted admin reaches what they were
+/// explicitly granted, which is usually nothing; role_ceiling caps the rest.
+async fn set_member_role(
+    mut db: auth::Db,
+    headers: HeaderMap,
+    Path(user_id): Path<Uuid>,
+    Json(req): Json<RoleRequest>,
+) -> ApiResult<Json<serde_json::Value>> {
+    let caller = db.caller;
+
+    use fury_shared::rbac::OrgRole;
+    if !matches!(caller.role, OrgRole::Owner | OrgRole::Admin) {
+        return Err(ApiError::Denied(Perm::ManageAccess));
+    }
+    let role = auth::parse_role(&req.role)
+        .ok_or_else(|| ApiError::BadRequest("unknown role".into()))?;
+    if matches!(role, OrgRole::Owner) {
+        return Err(ApiError::BadRequest(
+            "an organisation has one owner. Make them an admin for the same reach".into(),
+        ));
+    }
+    if user_id == caller.user_id {
+        return Err(ApiError::BadRequest(
+            "your own role is changed by the owner, not by you".into(),
+        ));
+    }
+
+    // Scoped to the caller's organisation: a user id from another team is
+    // somebody this caller cannot see, and answers like one.
+    let current: Option<(String,)> = sqlx::query_as(
+        "SELECT role::text FROM org_members WHERE org_id = $1 AND user_id = $2",
+    )
+    .bind(caller.org_id)
+    .bind(user_id)
+    .fetch_optional(db.as_mut())
+    .await?;
+    let (current,) = current.ok_or(ApiError::NotFound)?;
+    let from = auth::parse_role(&current).ok_or(ApiError::NotFound)?;
+
+    if matches!(from, OrgRole::Owner) {
+        return Err(ApiError::BadRequest("the owner's role cannot be changed".into()));
+    }
+    if matches!(caller.role, OrgRole::Admin)
+        && (matches!(role, OrgRole::Admin) || matches!(from, OrgRole::Admin))
+    {
+        return Err(ApiError::Denied(Perm::ManageAccess));
+    }
+    if from == role {
+        return Ok(Json(json!({ "role": req.role, "changed": false })));
+    }
+    if matches!(role, OrgRole::Admin) {
+        crate::security::require_step_up(db.as_mut(), &caller, &headers).await?;
+    }
+
+    sqlx::query("UPDATE org_members SET role = $1::org_role WHERE org_id = $2 AND user_id = $3")
+        .bind(&req.role)
+        .bind(caller.org_id)
+        .bind(user_id)
+        .execute(db.as_mut())
+        .await?;
+
+    // A grant that follows one of the organisation's roles is rewritten
+    // against the new ceiling: a member made manager on "lead" gets the
+    // "give access" box the role has and the member ceiling withheld.
+    relink(db.as_mut(), None, Some(user_id)).await?;
+
+    audit(
+        db.as_mut(),
+        &caller,
+        "member.role",
+        None,
+        json!({ "target": user_id, "from": current, "to": req.role }),
+    )
+    .await?;
+    Ok(Json(json!({ "role": req.role, "changed": true })))
+}
+
+/// Everything a client needs to compute a new organisation key.
+///
+/// Only the material, never a decision: the public keys the new key must be
+/// sealed to, and the wrapped data keys that must be re-wrapped under it. The
+/// server cannot open any of it and does not try.
+async fn rotation_material(
+    mut db: auth::Db,
+) -> ApiResult<Json<serde_json::Value>> {
+    // Copied out so that reading it does not borrow the connection: a
+    // handler needs both in the same expression constantly.
+    let caller = db.caller;
+
+    use fury_shared::rbac::OrgRole;
+    if !matches!(caller.role, OrgRole::Owner | OrgRole::Admin) {
+        return Err(ApiError::Denied(Perm::ManageAccess));
+    }
+
+    use base64::Engine;
+    let b64 = |v: &[u8]| base64::engine::general_purpose::STANDARD.encode(v);
+    let hex = |v: &[u8]| v.iter().map(|b| format!("{b:02x}")).collect::<String>();
+
+    // Only members who already hold the key.
+    //
+    // Enrolling makes an account; being handed the organisation key is a
+    // separate, deliberate act, and `has_key: false` is the gate an admin sees.
+    // Without this predicate a rotation walked straight through it: everyone
+    // who had ever enrolled — including someone an admin looked at and chose
+    // not to admit — was sealed the new key by an operation nobody associates
+    // with granting access. Worse, the completeness check below made omitting
+    // them impossible.
+    let members: Vec<(Uuid, String, Vec<u8>)> = sqlx::query_as(
+        "SELECT u.id, u.email, u.public_key FROM org_members m \
+         JOIN users u ON u.id = m.user_id \
+         WHERE m.org_id = $1 AND u.disabled_at IS NULL AND m.wrapped_ork IS NOT NULL",
+    )
+    .bind(caller.org_id)
+    .fetch_all(db.as_mut())
+    .await?;
+
+    let proxies: Vec<(Uuid, Option<Vec<u8>>)> = sqlx::query_as(
+        "SELECT id, wrapped_dek FROM proxies WHERE org_id = $1 AND deleted_at IS NULL",
+    )
+    .bind(caller.org_id)
+    .fetch_all(db.as_mut())
+    .await?;
+
+    let generation: i32 = sqlx::query_scalar("SELECT ork_generation FROM organizations WHERE id = $1")
+        .bind(caller.org_id)
+        .fetch_one(db.as_mut())
+        .await?;
+
+    // Everything else the old key reaches, and which a rotation that moved
+    // only members and proxies left behind. Until 14.10.2026 it did: every
+    // bundle, cookie jar and saved login of the organisation stopped opening
+    // the moment somebody was removed (migration 0020 says how that was met).
+    let profiles = rotation_profiles(db.as_mut(), caller.org_id).await?;
+    let bundles = rotation_bundles(db.as_mut(), caller.org_id).await?;
+    let credentials = rotation_credentials(db.as_mut(), caller.org_id).await?;
+    let shares = rotation_shares(db.as_mut(), caller.org_id).await?;
+
+    Ok(Json(json!({
+        "generation": generation,
+        // Every profile, for its cookie key: unwrapped under the old profile
+        // key when one is stored, derived from it when not, and wrapped under
+        // the new one either way.
+        "profiles": profiles.iter().map(|(id, ck)| json!({
+            "id": id, "wrapped_cookie_key": ck.as_deref().map(hex),
+        })).collect::<Vec<_>>(),
+        // Every version of every bundle sealed under a profile key. Stored as
+        // the agent's own text (`fury:ork1:` and base64), so it goes out as
+        // that text and comes back as it.
+        "bundles": bundles.iter().map(|(id, profile_id, w)| json!({
+            "id": id, "profile_id": profile_id, "wrapped_dek": String::from_utf8_lossy(w),
+        })).collect::<Vec<_>>(),
+        // Saved logins: a data key under the organisation key, stored as hex
+        // text -- the same shape the credential endpoints read and write.
+        "credentials": credentials.iter().map(|(id, w)| json!({
+            "id": id, "wrapped_dek": String::from_utf8_lossy(w),
+        })).collect::<Vec<_>>(),
+        // Profiles handed to somebody by key: the new profile key has to be
+        // sealed to them again, or the profile stops opening for them.
+        "shares": shares.iter().map(|(profile_id, user_id, pk)| json!({
+            "profile_id": profile_id, "user_id": user_id, "public_key": b64(pk),
+        })).collect::<Vec<_>>(),
+        "members": members.iter().map(|(id, email, pk)| json!({
+            "user_id": id, "email": email, "public_key": b64(pk),
+        })).collect::<Vec<_>>(),
+        // A proxy with no stored key has nothing to re-wrap; it is listed so
+        // the client can report it rather than silently leaving it behind.
+        "proxies": proxies.iter().map(|(id, dek)| json!({
+            "id": id, "wrapped_dek": dek.as_deref().map(hex),
+        })).collect::<Vec<_>>(),
+    })))
+}
+
+/// Every profile of the organisation with its stored cookie key, if any.
+/// Deleted ones too: the trash can be emptied back into use, and a profile
+/// restored with a cookie key from a retired generation is the failure this
+/// exists to stop.
+pub(crate) async fn rotation_profiles(
+    db: &mut sqlx::PgConnection,
+    org_id: Uuid,
+) -> Result<Vec<(Uuid, Option<Vec<u8>>)>, sqlx::Error> {
+    sqlx::query_as("SELECT id, wrapped_cookie_key FROM profiles WHERE org_id = $1")
+        .bind(org_id)
+        .fetch_all(db)
+        .await
+}
+
+/// Every bundle sealed under a profile key. One sealed under a machine key
+/// (no prefix, from before team bundles had their own) opens only on the
+/// machine that packed it, whatever the organisation key is, and is left alone.
+pub(crate) async fn rotation_bundles(
+    db: &mut sqlx::PgConnection,
+    org_id: Uuid,
+) -> Result<Vec<(Uuid, Uuid, Vec<u8>)>, sqlx::Error> {
+    sqlx::query_as(
+        "SELECT b.id, b.profile_id, b.wrapped_dek FROM bundles b \
+         JOIN profiles p ON p.id = b.profile_id \
+         WHERE p.org_id = $1 AND position($2::bytea IN b.wrapped_dek) = 1",
+    )
+    .bind(org_id)
+    .bind(fury_shared::keys::SHARED_BUNDLE_PREFIX.as_bytes())
+    .fetch_all(db)
+    .await
+}
+
+pub(crate) async fn rotation_credentials(
+    db: &mut sqlx::PgConnection,
+    org_id: Uuid,
+) -> Result<Vec<(Uuid, Vec<u8>)>, sqlx::Error> {
+    sqlx::query_as(
+        "SELECT c.id, c.wrapped_dek FROM credentials c \
+         JOIN profiles p ON p.id = c.profile_id WHERE p.org_id = $1",
+    )
+    .bind(org_id)
+    .fetch_all(db)
+    .await
+}
+
+/// Profiles given to a person with the key sealed to them, and that person's
+/// public key. The person may be in another organisation; `users` is not
+/// behind a policy, and the grant is.
+pub(crate) async fn rotation_shares(
+    db: &mut sqlx::PgConnection,
+    org_id: Uuid,
+) -> Result<Vec<(Uuid, Uuid, Vec<u8>)>, sqlx::Error> {
+    sqlx::query_as(
+        "SELECT g.profile_id, g.user_id, u.public_key FROM profile_grants g \
+         JOIN profiles p ON p.id = g.profile_id \
+         JOIN users u ON u.id = g.user_id \
+         WHERE p.org_id = $1 AND g.wrapped_key IS NOT NULL",
+    )
+    .bind(org_id)
+    .fetch_all(db)
+    .await
+}
+
+#[derive(Deserialize)]
+pub struct RotateRequest {
+    /// Whose membership this rotation is retiring. `None` rotates without
+    /// removing anyone — after a laptop is lost, say.
+    #[serde(default)]
+    remove_user_id: Option<Uuid>,
+    /// The new key, sealed to every member who stays. Must be all of them.
+    members: Vec<RotatedMember>,
+    /// Every proxy data key, re-wrapped under the new organisation key.
+    proxies: Vec<RotatedProxy>,
+    /// The generation this was computed against, so two administrators
+    /// rotating at once cannot half-apply each other's work.
+    generation: i32,
+    /// Each profile's cookie key, wrapped under its new profile key.
+    #[serde(default)]
+    cookie_keys: Vec<RotatedCookieKey>,
+    /// Each bundle's data key, wrapped under its new profile key.
+    #[serde(default)]
+    bundles: Vec<RotatedBundle>,
+    /// Each saved login's data key, under the new organisation key.
+    #[serde(default)]
+    credentials: Vec<RotatedCredential>,
+    /// The new profile key, sealed to each person a profile was given to.
+    #[serde(default)]
+    shares: Vec<RotatedShare>,
+    /// Bundles, saved logins and cookie keys the old key did not open. Named
+    /// rather than silently left out, so that "this client could not" and
+    /// "this client did not know to" stay two different things: the first is
+    /// left as it is, the second refuses the rotation. They are already lost
+    /// to the old key -- an earlier rotation by a Fury that did not carry them
+    /// over -- and refusing would make one such profile block removing anyone
+    /// for good.
+    #[serde(default)]
+    unreadable: Vec<Uuid>,
+}
+
+#[derive(Deserialize)]
+pub struct RotatedCookieKey {
+    profile_id: Uuid,
+    wrapped_cookie_key: String,
+}
+
+#[derive(Deserialize)]
+pub struct RotatedBundle {
+    id: Uuid,
+    /// The agent's text form, `fury:ork1:` and base64.
+    wrapped_dek: String,
+}
+
+#[derive(Deserialize)]
+pub struct RotatedCredential {
+    id: Uuid,
+    /// Hex, as the credential endpoints store it.
+    wrapped_dek: String,
+}
+
+#[derive(Deserialize)]
+pub struct RotatedShare {
+    profile_id: Uuid,
+    user_id: Uuid,
+    wrapped_key: String,
+}
+
+#[derive(Deserialize)]
+pub struct RotatedMember {
+    user_id: Uuid,
+    wrapped_ork: String,
+}
+
+#[derive(Deserialize)]
+pub struct RotatedProxy {
+    id: Uuid,
+    wrapped_dek: String,
+}
+
+/// Replace the organisation key.
+///
+/// This is what makes removing somebody mean anything. A member who leaves
+/// keeps whatever they already downloaded — that is unavoidable, the work
+/// happened on their machine — but without rotation they also keep a key that
+/// opens everything the team does *afterwards*, which is not a leak, it is
+/// continued access. Deleting a grant while leaving the key in their hands is
+/// the security equivalent of changing the sign on the door.
+///
+/// Everything lands in one transaction. A half-rotated organisation is one
+/// where some proxies open under the old key and some under the new, and no
+/// single member can read all of them.
+/// Whether `caller` may remove a member whose role is `target`. The same
+/// line set_member_role draws: the owner is out of reach, and an admin
+/// manages managers and members, not other admins.
+fn may_remove(caller: fury_shared::rbac::OrgRole, target: fury_shared::rbac::OrgRole) -> ApiResult<()> {
+    use fury_shared::rbac::OrgRole;
+    match (caller, target) {
+        (_, OrgRole::Owner) => Err(ApiError::BadRequest("the owner cannot be removed from the organisation".into())),
+        (OrgRole::Owner, _) => Ok(()),
+        (OrgRole::Admin, OrgRole::Admin) => Err(ApiError::Denied(Perm::ManageAccess)),
+        (OrgRole::Admin, _) => Ok(()),
+        _ => Err(ApiError::Denied(Perm::ManageAccess)),
+    }
+}
+
+#[cfg(test)]
+mod may_remove_tests {
+    use super::may_remove;
+    use fury_shared::rbac::OrgRole::*;
+
+    #[test]
+    fn nobody_removes_the_owner_and_an_admin_stays_below_admin() {
+        for caller in [Owner, Admin, Manager, Member] {
+            assert!(may_remove(caller, Owner).is_err(), "{caller:?} removed the owner");
+        }
+        assert!(may_remove(Owner, Admin).is_ok());
+        assert!(may_remove(Owner, Member).is_ok());
+        assert!(may_remove(Admin, Admin).is_err());
+        assert!(may_remove(Admin, Manager).is_ok());
+        assert!(may_remove(Admin, Member).is_ok());
+        assert!(may_remove(Manager, Member).is_err());
+        assert!(may_remove(Member, Member).is_err());
+    }
+}
+
+async fn rotate_org_key(
+    mut db: auth::Db,
+    headers: HeaderMap,
+    Json(req): Json<RotateRequest>,
+) -> ApiResult<Json<serde_json::Value>> {
+    // Copied out so that reading it does not borrow the connection: a
+    // handler needs both in the same expression constantly.
+    let caller = db.caller;
+
+    use fury_shared::rbac::OrgRole;
+    if !matches!(caller.role, OrgRole::Owner | OrgRole::Admin) {
+        return Err(ApiError::Denied(Perm::ManageAccess));
+    }
+    // Removing a member is the action a stolen session would take; a plain
+    // rotation only costs everyone a re-fetch of the key.
+    if req.remove_user_id.is_some() {
+        crate::security::require_step_up(db.as_mut(), &caller, &headers).await?;
+    }
+    if req.remove_user_id == Some(caller.user_id) {
+        return Err(ApiError::BadRequest(
+            "you cannot remove yourself — the organisation would have nobody who can rotate the \
+             key again"
+                .into(),
+        ));
+    }
+
+    let mut tx = db.begin().await?;
+
+    // Locked for the duration, so a second administrator rotating at the same
+    // moment waits rather than interleaving.
+    let generation: i32 = sqlx::query_scalar(
+        "SELECT ork_generation FROM organizations WHERE id = $1 FOR UPDATE",
+    )
+    .bind(caller.org_id)
+    .fetch_one(&mut *tx)
+    .await?;
+    if generation != req.generation {
+        return Err(ApiError::Conflict(format!(
+            "this was computed against generation {} but the organisation is at {generation} — \
+             somebody else rotated in between. Start again",
+            req.generation
+        )));
+    }
+
+    if let Some(gone) = req.remove_user_id {
+        // Who may be removed is who may have their role changed
+        // (set_member_role): never the owner, and an admin only below admin.
+        // Until 14.10.2026 the caller's role was checked and the target's was
+        // not, so an admin could remove the owner, rotating the key to
+        // everyone but them.
+        let target: Option<String> = sqlx::query_scalar(
+            "SELECT role::text FROM org_members WHERE org_id = $1 AND user_id = $2 FOR UPDATE",
+        )
+        .bind(caller.org_id)
+        .bind(gone)
+        .fetch_optional(&mut *tx)
+        .await?;
+        let target = target.and_then(|r| auth::parse_role(&r)).ok_or(ApiError::NotFound)?;
+        may_remove(caller.role, target)?;
+
+        let removed = sqlx::query("DELETE FROM org_members WHERE org_id = $1 AND user_id = $2")
+            .bind(caller.org_id)
+            .bind(gone)
+            .execute(&mut *tx)
+            .await?;
+        if removed.rows_affected() == 0 {
+            return Err(ApiError::NotFound);
+        }
+        // Their grants and their sessions go with them. Leaving a live session
+        // would let a removed member keep working until it expired.
+        sqlx::query("DELETE FROM project_grants WHERE user_id = $1")
+            .bind(gone)
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query("DELETE FROM sessions WHERE user_id = $1")
+            .bind(gone)
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query("DELETE FROM profile_locks WHERE user_id = $1")
+            .bind(gone)
+            .execute(&mut *tx)
+            .await?;
+    }
+
+    // Every remaining member must be covered. One left out is one who can no
+    // longer decrypt anything, discovered later and unfixable without another
+    // rotation.
+    // Same predicate as the material, or the two disagree and one of them
+    // wins silently. A member with no key cannot be "locked out" by a rotation
+    // — they were never let in.
+    let remaining: Vec<(Uuid,)> = sqlx::query_as(
+        "SELECT user_id FROM org_members WHERE org_id = $1 AND wrapped_ork IS NOT NULL",
+    )
+    .bind(caller.org_id)
+    .fetch_all(&mut *tx)
+    .await?;
+    let supplied: std::collections::HashSet<Uuid> =
+        req.members.iter().map(|m| m.user_id).collect();
+    for (user_id,) in &remaining {
+        if !supplied.contains(user_id) {
+            return Err(ApiError::BadRequest(format!(
+                "no new key was supplied for member {user_id}; they would be locked out"
+            )));
+        }
+    }
+
+    let next = generation + 1;
+    for m in &req.members {
+        let wrapped = unhex_or_b64("wrapped_ork", &m.wrapped_ork)?;
+        if wrapped.len() < 104 {
+            return Err(ApiError::BadRequest(
+                "that is not a sealed organisation key".into(),
+            ));
+        }
+        // `wrapped_ork IS NOT NULL` here too, so a client that supplies an
+        // entry for a member who was never admitted writes nothing. Three
+        // places, one rule: rotation re-keys those who already hold a key, and
+        // admitting someone is `hand_over_key` and nothing else.
+        sqlx::query(
+            "UPDATE org_members SET wrapped_ork = $1, ork_generation = $2 \
+             WHERE org_id = $3 AND user_id = $4 AND wrapped_ork IS NOT NULL",
+        )
+        .bind(&wrapped)
+        .bind(next)
+        .bind(caller.org_id)
+        .bind(m.user_id)
+        .execute(&mut *tx)
+        .await?;
+    }
+
+    for x in &req.proxies {
+        let wrapped = unhex("wrapped_dek", &x.wrapped_dek)?;
+        if wrapped.len() < 40 {
+            return Err(ApiError::BadRequest("that is not a wrapped data key".into()));
+        }
+        sqlx::query("UPDATE proxies SET wrapped_dek = $1 WHERE id = $2 AND org_id = $3")
+            .bind(&wrapped)
+            .bind(x.id)
+            .bind(caller.org_id)
+            .execute(&mut *tx)
+            .await?;
+    }
+
+    // The rest of what the old key reaches, read again inside the transaction
+    // and under the lock: a bundle uploaded between the material and this
+    // request is one the client never saw, and has to refuse the rotation
+    // rather than be left under a key nobody will hold.
+    let unreadable: std::collections::HashSet<Uuid> = req.unreadable.iter().copied().collect();
+    // Said once for all four. The likely cause of a gap is not a bug but a
+    // Fury from before 0.3.20, which rotates members and proxies and knows
+    // nothing else -- and finishing its rotation is what broke profiles.
+    let missing = |what: &str, id: Uuid| {
+        ApiError::BadRequest(format!(
+            "this rotation leaves {what} {id} under the old key, where nobody could open it \
+             again. Update Fury on this machine and remove the member again"
+        ))
+    };
+
+    let profiles = rotation_profiles(&mut tx, caller.org_id).await?;
+    let supplied: std::collections::HashSet<Uuid> =
+        req.cookie_keys.iter().map(|c| c.profile_id).collect();
+    if let Some((id, _)) = profiles
+        .iter()
+        .find(|(id, _)| !supplied.contains(id) && !unreadable.contains(id))
+    {
+        return Err(missing("the cookie key of profile", *id));
+    }
+    for c in &req.cookie_keys {
+        let wrapped = unhex("wrapped_cookie_key", &c.wrapped_cookie_key)?;
+        if wrapped.len() < 40 {
+            return Err(ApiError::BadRequest("that is not a wrapped cookie key".into()));
+        }
+        sqlx::query("UPDATE profiles SET wrapped_cookie_key = $1 WHERE id = $2 AND org_id = $3")
+            .bind(&wrapped)
+            .bind(c.profile_id)
+            .bind(caller.org_id)
+            .execute(&mut *tx)
+            .await?;
+    }
+
+    let bundles = rotation_bundles(&mut tx, caller.org_id).await?;
+    let supplied: std::collections::HashSet<Uuid> = req.bundles.iter().map(|b| b.id).collect();
+    if let Some((id, _, _)) = bundles
+        .iter()
+        .find(|(id, _, _)| !supplied.contains(id) && !unreadable.contains(id))
+    {
+        return Err(missing("bundle", *id));
+    }
+    for b in &req.bundles {
+        if !b.wrapped_dek.starts_with(fury_shared::keys::SHARED_BUNDLE_PREFIX) || b.wrapped_dek.len() < 60 {
+            return Err(ApiError::BadRequest("that is not a wrapped bundle key".into()));
+        }
+        sqlx::query(
+            "UPDATE bundles SET wrapped_dek = $1 WHERE id = $2 \
+             AND profile_id IN (SELECT id FROM profiles WHERE org_id = $3)",
+        )
+        .bind(b.wrapped_dek.as_bytes())
+        .bind(b.id)
+        .bind(caller.org_id)
+        .execute(&mut *tx)
+        .await?;
+    }
+
+    let credentials = rotation_credentials(&mut tx, caller.org_id).await?;
+    let supplied: std::collections::HashSet<Uuid> = req.credentials.iter().map(|c| c.id).collect();
+    if let Some((id, _)) = credentials
+        .iter()
+        .find(|(id, _)| !supplied.contains(id) && !unreadable.contains(id))
+    {
+        return Err(missing("saved login", *id));
+    }
+    for c in &req.credentials {
+        // Checked as hex and stored as the text, which is how the credential
+        // endpoints keep it (`create_credential`).
+        if unhex("wrapped_dek", &c.wrapped_dek)?.len() < 40 {
+            return Err(ApiError::BadRequest("that is not a wrapped data key".into()));
+        }
+        sqlx::query(
+            "UPDATE credentials SET wrapped_dek = $1 WHERE id = $2 \
+             AND profile_id IN (SELECT id FROM profiles WHERE org_id = $3)",
+        )
+        .bind(c.wrapped_dek.as_bytes())
+        .bind(c.id)
+        .bind(caller.org_id)
+        .execute(&mut *tx)
+        .await?;
+    }
+
+    // No "unreadable" here: the new profile key is computed, not opened, so
+    // there is nothing that could fail to open.
+    let shares = rotation_shares(&mut tx, caller.org_id).await?;
+    let supplied: std::collections::HashSet<(Uuid, Uuid)> =
+        req.shares.iter().map(|g| (g.profile_id, g.user_id)).collect();
+    if let Some((profile_id, _, _)) = shares
+        .iter()
+        .find(|(p, u, _)| !supplied.contains(&(*p, *u)))
+    {
+        return Err(missing("the share of profile", *profile_id));
+    }
+    for g in &req.shares {
+        let wrapped = unhex_or_b64("wrapped_key", &g.wrapped_key)?;
+        if wrapped.len() < 104 {
+            return Err(ApiError::BadRequest("that is not a sealed profile key".into()));
+        }
+        sqlx::query(
+            "UPDATE profile_grants SET wrapped_key = $1 \
+             WHERE profile_id = $2 AND user_id = $3 AND wrapped_key IS NOT NULL \
+             AND profile_id IN (SELECT id FROM profiles WHERE org_id = $4)",
+        )
+        .bind(&wrapped)
+        .bind(g.profile_id)
+        .bind(g.user_id)
+        .bind(caller.org_id)
+        .execute(&mut *tx)
+        .await?;
+    }
+
+    sqlx::query("UPDATE organizations SET ork_generation = $1 WHERE id = $2")
+        .bind(next)
+        .bind(caller.org_id)
+        .execute(&mut *tx)
+        .await?;
+
+    tx.commit().await?;
+
+    audit(db.as_mut(), &caller, "org.rotate", None,
+          json!({
+              "removed": req.remove_user_id,
+              "generation": next,
+              "bundles": req.bundles.len(),
+              "credentials": req.credentials.len(),
+              "shares": req.shares.len(),
+              "unreadable": req.unreadable.len(),
+          })).await?;
+    Ok(Json(json!({
+        "generation": next,
+        "removed": req.remove_user_id,
+        "unreadable": req.unreadable.len(),
+    })))
+}
+
+/// Accepts hex, or base64 — `hand_over_key` established base64 for a sealed
+/// organisation key and the proxy endpoints hex for everything else. Rather
+/// than pick one and break the other, this takes either.
+fn unhex_or_b64(what: &str, v: &str) -> Result<Vec<u8>, ApiError> {
+    if v.len() % 2 == 0 && v.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return unhex(what, v);
+    }
+    use base64::Engine;
+    base64::engine::general_purpose::STANDARD
+        .decode(v)
+        .map_err(|_| ApiError::BadRequest(format!("{what} is neither hex nor base64")))
+}
+
+// ---------------------------------------------------------------------------
+// locks
+// ---------------------------------------------------------------------------
+
+#[derive(Deserialize)]
+pub struct LockRequest {
+    machine_id: String,
+    machine_name: String,
+    /// Only honoured with manage_access, and always audited.
+    #[serde(default)]
+    force: bool,
+}
+
+async fn acquire_lock(
+    mut db: auth::Db,
+    Path(profile_id): Path<Uuid>,
+    Json(req): Json<LockRequest>,
+) -> ApiResult<Json<AcquireLockResponse>> {
+    // Copied out so that reading it does not borrow the connection: a
+    // handler needs both in the same expression constantly.
+    let caller = db.caller;
+
+    let perms = rbac_guard::permissions_for_profile(db.as_mut(), caller.user_id, profile_id).await?;
+    if perms == PermSet::NONE {
+        return Err(ApiError::NotFound);
+    }
+    if !perms.has(Perm::Launch) {
+        return Err(ApiError::Denied(Perm::Launch));
+    }
+    if req.force && !perms.has(Perm::ManageAccess) {
+        return Err(ApiError::Denied(Perm::ManageAccess));
+    }
+
+    // Assembled before the lock is taken. A lock held on a profile that turns
+    // out to be unlaunchable is a profile nobody else can open for the next
+    // ninety seconds, over a failure that was knowable up front.
+    let mut spec = launch_spec(db.as_mut(), profile_id).await?;
+    spec.domain_lists = domain_lists_for(db.as_mut(), caller.user_id, profile_id).await?;
+
+    let (raw, digest) = auth::new_token();
+
+    // One statement, so two agents racing cannot both win.
+    //
+    // ON CONFLICT DO UPDATE with a WHERE, not a CTE that deletes first: a
+    // DELETE and an INSERT in the same statement see the same snapshot, so the
+    // INSERT still conflicts with the row the DELETE just removed. Measured —
+    // the first version made an authorised force-unlock return 409, which is
+    // precisely the case it existed to serve.
+    //
+    // The WHERE decides who may take over: an expired lock is free for anyone
+    // with launch, a live one only yields to an authorised force.
+    let inserted: Option<(i32,)> = sqlx::query_as(
+        r#"
+        INSERT INTO profile_locks
+            (profile_id, user_id, token_hash, machine_name, machine_id, expires_at)
+        VALUES ($1, $2, $3, $4, $6, now() + interval '90 seconds')
+        ON CONFLICT (profile_id) DO UPDATE
+        SET user_id = EXCLUDED.user_id,
+            token_hash = EXCLUDED.token_hash,
+            machine_name = EXCLUDED.machine_name,
+            machine_id = EXCLUDED.machine_id,
+            acquired_at = now(),
+            expires_at = EXCLUDED.expires_at
+        WHERE profile_locks.expires_at <= now() OR $5
+        RETURNING 1
+        "#,
+    )
+    .bind(profile_id)
+    .bind(caller.user_id)
+    .bind(&digest)
+    .bind(&req.machine_name)
+    .bind(req.force)
+    .bind(&req.machine_id)
+    .fetch_optional(db.as_mut())
+    .await?;
+
+    if inserted.is_none() {
+        // Someone else holds it. Say who — the operator needs to know which
+        // colleague to ask, and "locked" without a name is what turns this into
+        // a chat message.
+        let holder: Option<(String, String)> = sqlx::query_as(
+            "SELECT u.email, l.machine_name FROM profile_locks l \
+             JOIN users u ON u.id = l.user_id WHERE l.profile_id = $1",
+        )
+        .bind(profile_id)
+        .fetch_optional(db.as_mut())
+        .await?;
+        let (email, machine) = holder.unwrap_or_default();
+        return Err(ApiError::Locked(
+            json!({ "user_email": email, "machine_name": machine }),
+        ));
+    }
+
+    if req.force {
+        audit(db.as_mut(), &caller, "lock.force", Some(profile_id), json!({})).await?;
+    }
+    audit(db.as_mut(), &caller, "profile.launch", Some(profile_id),
+          json!({ "machine": req.machine_name })).await?;
+
+    // The launching agent is told exactly how to harden the browser. Computed
+    // here rather than trusted from the client, because these flags are the
+    // technical half of "an operator cannot take the data home".
+    let restrictions = LaunchRestrictions::for_perms(perms);
+
+    // Reported back so the agent knows when its heartbeat must land.
+    let expires_at: (String,) = sqlx::query_as(&format!(
+        "SELECT {} FROM profile_locks WHERE profile_id = $1",
+        rfc3339("expires_at")
+    ))
+    .bind(profile_id)
+    .fetch_one(db.as_mut())
+    .await?;
+    let expires_at = expires_at.0;
+
+    Ok(Json(AcquireLockResponse {
+        lock_token: raw,
+        expires_at: expires_at.to_string(),
+        restrictions,
+        spec,
+    }))
+}
+
+/// Everything needed to start one profile.
+///
+/// Refuses, with a sentence rather than a code, when the profile is missing
+/// something a launch cannot proceed without. The wording mirrors the agent's
+/// own (`agent/src/ipc.rs`), because an operator should read the same
+/// explanation whether the profile lives on this machine or on a server.
+/// The organisation's domain lists this caller's grant on the profile's
+/// project applies. Owners and admins have no grant row and get none: the
+/// lists are for the people they let in, not for themselves.
+pub(crate) async fn domain_lists_for(
+    db: &mut sqlx::PgConnection,
+    caller: Uuid,
+    profile_id: Uuid,
+) -> ApiResult<Vec<fury_shared::api::DomainListText>> {
+    let rows: Vec<(String, String)> = sqlx::query_as(
+        "SELECT l.name, l.body FROM project_grants g \
+         JOIN profiles f ON f.project_id = g.project_id \
+         JOIN org_domain_lists l ON l.id = ANY(g.domain_lists) \
+         WHERE f.id = $1 AND g.user_id = $2 \
+         ORDER BY l.name",
+    )
+    .bind(profile_id)
+    .bind(caller)
+    .fetch_all(&mut *db)
+    .await?;
+    Ok(rows.into_iter().map(|(name, body)| fury_shared::api::DomainListText { name, body }).collect())
+}
+
+async fn launch_spec(db: &mut sqlx::PgConnection, profile_id: Uuid) -> ApiResult<fury_shared::api::LaunchSpec> {
+    #[derive(sqlx::FromRow)]
+    struct Row {
+        name: String,
+        persona_id: String,
+        fp_seed: Vec<u8>,
+        timezone: Option<String>,
+        languages: Vec<String>,
+        start_urls: Vec<String>,
+        overrides: sqlx::types::Json<MachineOverrides>,
+        px_id: Option<Uuid>,
+        px_kind: Option<String>,
+        px_host: Option<String>,
+        px_port: Option<i32>,
+        credentials_enc: Option<Vec<u8>>,
+        wrapped_dek: Option<Vec<u8>>,
+        wrapped_cookie_key: Option<Vec<u8>>,
+        key_generation: Option<i32>,
+    }
+
+    // The generation through a subquery rather than a join: organizations has
+    // its own policy, and a profile someone was given from another
+    // organisation must still produce a spec -- with no generation, which the
+    // shell and the agent treat as "not checked".
+    let row: Row = sqlx::query_as(
+        "SELECT f.name, f.persona_id, f.fp_seed, f.timezone, f.languages, f.start_urls, f.overrides,                 x.id AS px_id, x.kind::text AS px_kind, x.host AS px_host, x.port AS px_port,                 x.credentials_enc, x.wrapped_dek, f.wrapped_cookie_key,                 (SELECT o.ork_generation FROM organizations o WHERE o.id = f.org_id) AS key_generation          FROM profiles f          LEFT JOIN proxies x ON x.id = f.proxy_id AND x.deleted_at IS NULL          WHERE f.id = $1 AND f.deleted_at IS NULL",
+    )
+    .bind(profile_id)
+    .fetch_optional(&mut *db)
+    .await?
+    .ok_or(ApiError::NotFound)?;
+
+    let (Some(px_id), Some(kind), Some(host), Some(port)) =
+        (row.px_id, row.px_kind, row.px_host, row.px_port)
+    else {
+        return Err(ApiError::BadRequest(
+            "this profile has no proxy. Everything the browser does goes through one, so              launching without it would send traffic from the operator's own address"
+                .into(),
+        ));
+    };
+    let (Some(credentials_enc), Some(wrapped_dek)) = (row.credentials_enc, row.wrapped_dek) else {
+        return Err(ApiError::BadRequest(format!(
+            "the proxy on this profile has no stored credentials. It was created before              credentials were sealed, or by a client that could not seal them — open it in              Proxies and save it again ({px_id})"
+        )));
+    };
+    // Absence is the instruction: no stored timezone means the profile follows
+    // its exit, and the agent resolves the zone from the address the proxy
+    // actually leaves through — which it can do and this server cannot, having
+    // never seen the exit and holding no proxy credentials.
+    //
+    // One rule, and the same one a local profile uses. This used to refuse a
+    // NULL outright, so the shell always sent a string, so the agent's
+    // follow-the-exit branch was dead code for every team profile: the feature
+    // existed and only local profiles could reach it.
+    //
+    // Deliberately NOT keyed on the `auto_timezone` / `auto_locale` columns
+    // that have sat in the schema since the first migration. Nothing had ever
+    // read them, every existing row has them TRUE by default, and honouring
+    // them now would discard the timezone every one of those profiles has
+    // stored. Two representations of one fact, one of which is stale — the
+    // migration beside this change drops them.
+    let timezone = row.timezone;
+    let languages = (!row.languages.is_empty()).then_some(row.languages);
+
+    let fp_seed = fury_shared::persona::seed::from_bytes(&row.fp_seed)
+        .map(fury_shared::persona::seed::to_hex)
+        .ok_or_else(|| {
+            ApiError::Internal(anyhow::anyhow!(
+                "profile {profile_id} has a {}-byte seed; it must be 8",
+                row.fp_seed.len()
+            ))
+        })?;
+
+    Ok(fury_shared::api::LaunchSpec {
+        profile_id,
+        name: row.name,
+        persona_id: row.persona_id,
+        fp_seed,
+        timezone,
+        languages,
+        overrides: row.overrides.0,
+        start_urls: row.start_urls,
+        // Filled in by the caller that knows who is launching; the spec
+        // itself is about the profile.
+        domain_lists: Vec::new(),
+        wrapped_cookie_key: row
+            .wrapped_cookie_key
+            .map(|v| v.iter().map(|b| format!("{b:02x}")).collect()),
+        key_generation: row.key_generation,
+        proxy: fury_shared::api::SealedProxy {
+            id: px_id,
+            kind,
+            host,
+            port: port as u16,
+            credentials_enc,
+            wrapped_dek,
+        },
+    })
+}
+
+// ---------------------------------------------------------------------------
+// credentials
+// ---------------------------------------------------------------------------
+//
+// A login that belongs to a profile: the username, the password, and the
+// two-factor seed. The server holds a blob it cannot read and a wrapped key it
+// cannot open, exactly as it does for proxy credentials and profile bundles.
+//
+// Gated on RevealSecrets rather than on Launch, and the distinction is the
+// point of the permission. Anyone who may open a profile is working inside a
+// logged-in browser and never needs to see the password; the person who needs
+// the password is the one setting the account up, or recovering it, and that is
+// a different and smaller group. An operator who can launch but not reveal can
+// do their job and cannot take the account home.
+
+#[derive(Deserialize)]
+pub struct CredentialBody {
+    label: String,
+    #[serde(default)]
+    site: String,
+    /// Hex. `{username, password, totp, notes}` sealed under a data key.
+    payload_enc: String,
+    /// Hex. That data key, wrapped under the organisation key.
+    wrapped_dek: String,
+}
+
+async fn list_credentials(
+    mut db: auth::Db,
+    Path(profile_id): Path<Uuid>,
+) -> ApiResult<Json<serde_json::Value>> {
+    let caller = db.caller;
+    let perms = rbac_guard::permissions_for_profile(db.as_mut(), caller.user_id, profile_id).await?;
+    if perms == PermSet::NONE {
+        return Err(ApiError::NotFound);
+    }
+    if !perms.has(Perm::RevealSecrets) {
+        return Err(ApiError::Denied(Perm::RevealSecrets));
+    }
+
+    let rows: Vec<(Uuid, String, String, Vec<u8>, Vec<u8>)> = sqlx::query_as(
+        "SELECT id, label, site, payload_enc, wrapped_dek FROM credentials
+         WHERE profile_id = $1 ORDER BY label",
+    )
+    .bind(profile_id)
+    .fetch_all(db.as_mut())
+    .await?;
+
+    // Reading a login is worth recording. A password taken out of a shared
+    // account is the event an investigation starts from, and "who saw it and
+    // when" is the only question that gets asked.
+    if !rows.is_empty() {
+        audit(db.as_mut(), &caller, "credential.reveal", Some(profile_id),
+              json!({ "count": rows.len() })).await?;
+    }
+
+    Ok(Json(json!(rows
+        .into_iter()
+        .map(|(id, label, site, payload, dek)| json!({
+            "id": id,
+            "label": label,
+            "site": site,
+            "payload_enc": String::from_utf8_lossy(&payload),
+            "wrapped_dek": String::from_utf8_lossy(&dek),
+        }))
+        .collect::<Vec<_>>())))
+}
+
+async fn create_credential(
+    mut db: auth::Db,
+    Path(profile_id): Path<Uuid>,
+    Json(req): Json<CredentialBody>,
+) -> ApiResult<Json<serde_json::Value>> {
+    let caller = db.caller;
+    let perms = rbac_guard::permissions_for_profile(db.as_mut(), caller.user_id, profile_id).await?;
+    if perms == PermSet::NONE {
+        return Err(ApiError::NotFound);
+    }
+    if !perms.has(Perm::RevealSecrets) {
+        return Err(ApiError::Denied(Perm::RevealSecrets));
+    }
+    // The same shape check the proxy credentials get: a client that forgot to
+    // seal sends something short, and storing it would put a password in the
+    // database in the clear while every part of this file claimed otherwise.
+    if req.payload_enc.len() < 40 || req.wrapped_dek.len() < 40 {
+        return Err(ApiError::BadRequest(
+            "payload_enc and wrapped_dek must be sealed values".into(),
+        ));
+    }
+
+    let id = Uuid::now_v7();
+    sqlx::query(
+        "INSERT INTO credentials (id, profile_id, label, site, payload_enc, wrapped_dek)
+         VALUES ($1, $2, $3, $4, $5, $6)",
+    )
+    .bind(id)
+    .bind(profile_id)
+    .bind(&req.label)
+    .bind(&req.site)
+    .bind(req.payload_enc.as_bytes())
+    .bind(req.wrapped_dek.as_bytes())
+    .execute(db.as_mut())
+    .await?;
+
+    audit(db.as_mut(), &caller, "credential.create", Some(profile_id),
+          json!({ "label": req.label })).await?;
+    Ok(Json(json!({ "id": id })))
+}
+
+async fn edit_credential(
+    mut db: auth::Db,
+    Path((profile_id, credential_id)): Path<(Uuid, Uuid)>,
+    Json(req): Json<CredentialBody>,
+) -> ApiResult<Json<serde_json::Value>> {
+    let caller = db.caller;
+    let perms = rbac_guard::permissions_for_profile(db.as_mut(), caller.user_id, profile_id).await?;
+    if perms == PermSet::NONE {
+        return Err(ApiError::NotFound);
+    }
+    if !perms.has(Perm::RevealSecrets) {
+        return Err(ApiError::Denied(Perm::RevealSecrets));
+    }
+    if req.payload_enc.len() < 40 || req.wrapped_dek.len() < 40 {
+        return Err(ApiError::BadRequest(
+            "payload_enc and wrapped_dek must be sealed values".into(),
+        ));
+    }
+
+    // profile_id in the WHERE as well as the id: without it, a caller with
+    // rights on one profile could edit a login belonging to another by naming
+    // its id in the path, and the permission check above would have passed on
+    // the wrong profile.
+    let done = sqlx::query(
+        "UPDATE credentials SET label = $3, site = $4, payload_enc = $5, wrapped_dek = $6,
+                updated_at = now()
+         WHERE id = $1 AND profile_id = $2",
+    )
+    .bind(credential_id)
+    .bind(profile_id)
+    .bind(&req.label)
+    .bind(&req.site)
+    .bind(req.payload_enc.as_bytes())
+    .bind(req.wrapped_dek.as_bytes())
+    .execute(db.as_mut())
+    .await?;
+    if done.rows_affected() == 0 {
+        return Err(ApiError::NotFound);
+    }
+
+    audit(db.as_mut(), &caller, "credential.edit", Some(profile_id),
+          json!({ "label": req.label })).await?;
+    Ok(Json(json!({ "ok": true })))
+}
+
+async fn delete_credential(
+    mut db: auth::Db,
+    Path((profile_id, credential_id)): Path<(Uuid, Uuid)>,
+) -> ApiResult<Json<serde_json::Value>> {
+    let caller = db.caller;
+    let perms = rbac_guard::permissions_for_profile(db.as_mut(), caller.user_id, profile_id).await?;
+    if perms == PermSet::NONE {
+        return Err(ApiError::NotFound);
+    }
+    if !perms.has(Perm::RevealSecrets) {
+        return Err(ApiError::Denied(Perm::RevealSecrets));
+    }
+
+    // Hard delete, unlike a profile. A login somebody removed is a login they
+    // meant to remove, and a soft-deleted password is a password still in the
+    // database.
+    let done = sqlx::query("DELETE FROM credentials WHERE id = $1 AND profile_id = $2")
+        .bind(credential_id)
+        .bind(profile_id)
+        .execute(db.as_mut())
+        .await?;
+    if done.rows_affected() == 0 {
+        return Err(ApiError::NotFound);
+    }
+
+    audit(db.as_mut(), &caller, "credential.delete", Some(profile_id),
+          json!({ "id": credential_id })).await?;
+    Ok(Json(json!({ "deleted": true })))
+}
+
+// ---------------------------------------------------------------------------
+// bundles
+// ---------------------------------------------------------------------------
+//
+// Bytes go through the server for now. docs/01 says it should not proxy them,
+// and for a public host that is right — presigned URLs into object storage, so
+// the server stays small and the bandwidth bill lands where the storage is. For
+// one team on one box, a directory is the honest answer: it works, it backs up
+// with the rest of the machine, and it does not require standing up MinIO to
+// share a profile with three colleagues.
+//
+// They go through it STREAMED, which is not the same statement. The first
+// version took `body: Bytes`, and two things followed that nobody noticed
+// because the tests used bundles a few hundred bytes long:
+//
+//   - axum's default body limit is 2 MB. Every real profile on the machine this
+//     was found on was larger — 8.4, 8.7 and 33 MB — so team sync answered 413
+//     to every upload it had ever been asked to make, and said so only in a
+//     status code nothing was reading.
+//   - a bundle was held whole in server memory. Three operators closing large
+//     profiles at once is the machine.
+//
+// What the server never has is a key. It stores ciphertext, the wrapped key it
+// cannot open, and a digest *of the ciphertext* so it can verify what it holds
+// without being able to read it.
+
+pub fn bundle_root() -> std::path::PathBuf {
+    std::env::var("FURY_BUNDLE_DIR")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|_| std::path::PathBuf::from("/var/lib/fury/bundles"))
+}
+
+/// Checked once, at startup.
+///
+/// The alternative is finding out at the first upload, which is the first time
+/// someone closes a browser after a full working session — the worst possible
+/// moment to discover that the directory is missing or read-only, because the
+/// answer arrives as a 500 and the operator's next question is where their
+/// afternoon went.
+pub fn check_bundle_root() -> anyhow::Result<std::path::PathBuf> {
+    let dir = bundle_root();
+    std::fs::create_dir_all(&dir).map_err(|e| {
+        anyhow::anyhow!(
+            "cannot create the bundle directory {} ({e}). Create it and give this process \
+             ownership, or set FURY_BUNDLE_DIR somewhere writable",
+            dir.display()
+        )
+    })?;
+
+    let probe = dir.join(".writable");
+    std::fs::write(&probe, b"").map_err(|e| {
+        anyhow::anyhow!(
+            "the bundle directory {} exists but is not writable ({e})",
+            dir.display()
+        )
+    })?;
+    let _ = std::fs::remove_file(&probe);
+    Ok(dir)
+}
+
+/// A file that is removed when this goes out of scope, unless disarmed.
+///
+/// An upload writes a file before it knows whether the upload will stand, and
+/// every way out after that has to take the file with it. Each early return
+/// used to remove it by hand, and the ones nobody wrote leaked: a 409 because
+/// a colleague uploaded first, a failed query, a failed rename -- and after the
+/// rename, a database error left a finished `<version>.bundle` that no row
+/// names. None of it counted against a quota, and nothing swept it (found
+/// 14.10.2026, reading the handler after a tester asked about his disk). A
+/// handler dropped mid-upload, a client gone or the server shutting down, ran
+/// none of the hand-written removals at all; this runs on drop.
+struct RemoveOnDrop(Option<std::path::PathBuf>);
+
+impl RemoveOnDrop {
+    fn new(path: std::path::PathBuf) -> Self {
+        Self(Some(path))
+    }
+    /// The file has a row naming it now, or it was moved away: keep it.
+    fn disarm(&mut self) {
+        self.0 = None;
+    }
+}
+
+impl Drop for RemoveOnDrop {
+    fn drop(&mut self) {
+        if let Some(path) = self.0.take() {
+            match std::fs::remove_file(&path) {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => tracing::warn!(error = %e, path = %path.display(), "could not remove an abandoned upload"),
+            }
+        }
+    }
+}
+
+/// The prefix of an upload still being received. See `upload_bundle`.
+const INCOMING: &str = ".incoming-";
+
+/// Removes uploads that stopped being written more than `idle` ago.
+///
+/// What [`RemoveOnDrop`] cannot catch: a server killed outright mid-upload, and
+/// the files the handler leaked before it existed. At startup, so a server
+/// that has been leaking cleans up once it is updated. By the time a file was
+/// last written rather than created: a slow upload of a large profile is
+/// written to the whole time it lasts, so it is never mistaken for a dead one.
+///
+/// Only `.incoming-*` files. A `<version>.bundle` with no row is also dead
+/// weight, but telling that needs the database, and a query here runs with no
+/// identity, under which row-level security shows no rows at all -- every
+/// bundle would look orphaned.
+pub fn sweep_abandoned_uploads(root: &std::path::Path, idle: std::time::Duration) -> usize {
+    let mut removed = 0;
+    let Ok(profiles) = std::fs::read_dir(root) else { return 0 };
+    for dir in profiles.flatten().filter(|d| d.path().is_dir()) {
+        let Ok(files) = std::fs::read_dir(dir.path()) else { continue };
+        for f in files.flatten() {
+            if !f.file_name().to_string_lossy().starts_with(INCOMING) {
+                continue;
+            }
+            let stale = f
+                .metadata()
+                .and_then(|m| m.modified())
+                .ok()
+                .and_then(|t| t.elapsed().ok())
+                .is_some_and(|age| age >= idle);
+            if stale && std::fs::remove_file(f.path()).is_ok() {
+                removed += 1;
+            }
+        }
+    }
+    removed
+}
+
+/// Upload a new version.
+///
+/// The version the client based its work on comes in a header, and a mismatch
+/// is a 409 rather than an overwrite. That check is the whole point: two people
+/// with the same profile open produce two bundles, and silently keeping the
+/// later one loses whatever the first did — which for a warmed account can be
+/// weeks of work.
+/// The largest bundle this server will accept, in bytes.
+///
+/// There is a limit because a body arriving over HTTP is written by whoever is
+/// sending it, and "no limit" means one operator can fill the disk. There is
+/// not a SMALL limit because axum's default is 2 MB and that is smaller than
+/// any real profile: measured on this machine, three profiles in daily use were
+/// 8.4, 8.7 and 33 MB. Team sync had never worked for a real profile — every
+/// upload was refused with 413, and nothing said so out loud.
+///
+/// One gigabyte is generous on purpose. Bundles skip caches now (bundle.rs) so
+/// what travels is cookies, storage, history and preferences, which is
+/// megabytes; a profile that reaches a gigabyte has something in it worth
+/// asking about, and a refusal is the way to ask.
+/// How many versions of one profile's bundle to keep.
+///
+/// Every close writes a new one and nothing used to remove the old ones, so a
+/// profile opened ten times a day grew by ten bundles a day, for ever. That is
+/// not abuse — it is the product working — and it meant a storage quota filled
+/// up from ordinary use, which would have made the quota look arbitrary and the
+/// server look broken.
+///
+/// Ten because the reason to keep any at all is recovery: somebody logs a
+/// profile out, or a site wipes its storage, and the answer is the version from
+/// before that happened. Ten closes back is far enough to reach yesterday and
+/// near enough that the disk cost stays bounded — ten times a couple of
+/// megabytes for a cache-free bundle.
+///
+/// Set FURY_KEEP_BUNDLE_VERSIONS=0 to keep everything, which is what a server
+/// with cheap disk and nervous operators may want.
+pub fn keep_bundle_versions() -> i64 {
+    std::env::var("FURY_KEEP_BUNDLE_VERSIONS")
+        .ok()
+        .and_then(|v| v.trim().parse().ok())
+        .unwrap_or(10)
+}
+
+pub fn max_bundle_bytes() -> usize {
+    std::env::var("FURY_MAX_BUNDLE_BYTES")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(1024 * 1024 * 1024)
+}
+
+async fn upload_bundle(
+    State(state): State<Arc<AppState>>,
+    mut db: auth::Db,
+    Path(profile_id): Path<Uuid>,
+    headers: axum::http::HeaderMap,
+    body: axum::body::Body,
+) -> ApiResult<Json<serde_json::Value>> {
+    // Copied out so that reading it does not borrow the connection: a
+    // handler needs both in the same expression constantly.
+    let caller = db.caller;
+
+    let perms = rbac_guard::permissions_for_profile(db.as_mut(), caller.user_id, profile_id).await?;
+    if perms == PermSet::NONE {
+        return Err(ApiError::NotFound);
+    }
+    // Uploading is what launching a profile leads to, so it is gated by the
+    // same right rather than one of its own: anyone who may open a profile is
+    // necessarily allowed to change it, and a separate permission would only
+    // produce operators who can work but cannot save.
+    if !perms.has(Perm::Launch) {
+        return Err(ApiError::Denied(Perm::Launch));
+    }
+
+    let header = |name: &str| -> Option<String> {
+        headers.get(name).and_then(|v| v.to_str().ok()).map(str::to_string)
+    };
+
+    let wrapped_key = header("x-fury-wrapped-key")
+        .ok_or_else(|| ApiError::BadRequest("missing x-fury-wrapped-key".into()))?;
+    let sha256 = header("x-fury-sha256")
+        .ok_or_else(|| ApiError::BadRequest("missing x-fury-sha256".into()))?;
+    let base_version: i32 = header("x-fury-base-version")
+        .and_then(|v| v.parse().ok())
+        .ok_or_else(|| ApiError::BadRequest("missing x-fury-base-version".into()))?;
+    // The organisation key generation the bundle's key was derived from, as
+    // the shell checked it at launch. Absent from an agent older than the
+    // check, which is let through as before.
+    let key_generation: Option<i32> = header("x-fury-key-generation").and_then(|v| v.parse().ok());
+
+    // Holding the lock is what authorises an upload — the permission only says
+    // this person may work on the profile at all.
+    //
+    // Without this check the version test is the only guard, and it does not
+    // guard the case that matters: while Alice has the profile open, Bob (who
+    // also has Launch) can pull the current version, upload anything at all,
+    // and Alice's whole session is refused at 409 when she closes her browser.
+    // Her cookies are still on her disk, which is a recovery, not an outcome.
+    // The token rather than the user id, so that a second machine signed in as
+    // the same person cannot upload over the machine actually running it.
+    let lock_token = header("x-fury-lock-token")
+        .ok_or_else(|| ApiError::BadRequest("missing x-fury-lock-token".into()))?;
+    let holds_lock: bool = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM profile_locks \
+         WHERE profile_id = $1 AND token_hash = $2 AND expires_at > now())",
+    )
+    .bind(profile_id)
+    .bind(auth::hash_token(&lock_token))
+    .fetch_one(db.as_mut())
+    .await?;
+    if !holds_lock {
+        return Err(ApiError::Conflict(
+            "this profile is not locked by you — it may have been taken over, or the lock \
+             lapsed while the browser was running. Nothing was overwritten"
+                .into(),
+        ));
+    }
+
+    // Streamed to a temporary file, hashed on the way past, and only then moved
+    // into place. Three things at once:
+    //
+    //   - a bundle is never held whole in memory. It used to be
+    //     `body: Bytes`, which meant a 300 MB upload was 300 MB of server, and
+    //     several at once was the machine.
+    //   - the digest is verified BEFORE anything is visible. A truncated upload
+    //     recorded as a version is a profile that restores broken, and the
+    //     operator finds out on the machine that needed it.
+    //   - the move is atomic within the directory, so a client that disappears
+    //     mid-upload leaves a stray temporary file rather than a half-written
+    //     version somebody will later be handed.
+    use futures_util::StreamExt;
+    use sha2::{Digest, Sha256};
+
+    let dir = bundle_root().join(profile_id.to_string());
+    std::fs::create_dir_all(&dir).map_err(|e| ApiError::Internal(e.into()))?;
+    let staging = dir.join(format!("{INCOMING}{}", Uuid::now_v7()));
+    let mut staging_guard = RemoveOnDrop::new(staging.clone());
+
+    // What this organisation has already stored, so the ceiling is on the org
+    // and not only on the single upload. Read once, before the stream, because
+    // asking per chunk would be a query per 8 KB.
+    //
+    // Counted from the rows rather than the filesystem: the rows are what a
+    // delete removes, so freeing space frees the allowance, and a stray file
+    // left by a crash does not charge somebody for storage they cannot see.
+    let org_used: i64 = sqlx::query_scalar(
+        // ::BIGINT is load-bearing. sum() over BIGINT returns NUMERIC in
+        // PostgreSQL, and decoding that into i64 fails at runtime — so without
+        // the cast, setting FURY_MAX_STORAGE_PER_ORG turns every upload into a
+        // 500 and the limit breaks the thing it was meant to protect. Found by
+        // uploading, not by reading.
+        "SELECT coalesce(sum(b.size_bytes), 0)::BIGINT FROM bundles b
+         JOIN profiles p ON p.id = b.profile_id
+         WHERE p.org_id = $1",
+    )
+    .bind(caller.org_id)
+    .fetch_one(db.as_mut())
+    .await?;
+    let org_ceiling = state.limits.max_storage_per_org;
+
+    let mut hasher = Sha256::new();
+    let mut written: usize = 0;
+    let limit = max_bundle_bytes();
+    {
+        let mut file = std::fs::File::create(&staging).map_err(|e| ApiError::Internal(e.into()))?;
+        let mut stream = body.into_data_stream();
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk.map_err(|e| ApiError::BadRequest(format!("the upload stopped early: {e}")))?;
+            written += chunk.len();
+            if written > limit {
+                return Err(ApiError::BadRequest(format!(
+                    "this bundle is over the {} limit for this server",
+                    human_bytes(limit as i64)
+                )));
+            }
+            // Stopped mid-stream rather than after it. A refusal that arrives
+            // once the whole thing has been received has already cost the disk
+            // and the bandwidth it was meant to protect.
+            if let Some(ceiling) = org_ceiling {
+                if org_used + written as i64 > ceiling {
+                    return Err(ApiError::BadRequest(format!(
+                        "this organisation may store {} and has {}; the upload was \
+                         stopped after {}. Delete a profile, or ask whoever runs the \
+                         server for more room",
+                        human_bytes(ceiling),
+                        human_bytes(org_used),
+                        human_bytes(written as i64),
+                    )));
+                }
+            }
+            hasher.update(&chunk);
+            use std::io::Write;
+            file.write_all(&chunk).map_err(|e| ApiError::Internal(e.into()))?;
+        }
+    }
+
+    let actual: String = hasher.finalize().iter().map(|b| format!("{b:02x}")).collect();
+    if actual != sha256 {
+        return Err(ApiError::BadRequest(
+            "the body does not match the digest it was sent with".into(),
+        ));
+    }
+
+    let mut tx = db.begin().await?;
+
+    // FOR UPDATE, inside the transaction that records the version: two uploads
+    // that both read version 5 would otherwise both move their file to
+    // 6.bundle, the second over the first, and one row would end up naming the
+    // other's bytes. The second now waits here, then reads 6 and gets the 409.
+    let current: i32 = sqlx::query_scalar("SELECT current_version FROM profiles WHERE id = $1 FOR UPDATE")
+        .bind(profile_id)
+        .fetch_optional(&mut *tx)
+        .await?
+        .ok_or(ApiError::NotFound)?;
+
+    if base_version != current {
+        return Err(ApiError::Conflict(format!(
+            "this is based on version {base_version}, but the profile is at {current} —              someone else uploaded in between"
+        )));
+    }
+
+    let version = current + 1;
+    let key = format!("{profile_id}/{version}.bundle");
+    std::fs::rename(&staging, bundle_root().join(&key))
+        .map_err(|e| ApiError::Internal(e.into()))?;
+    staging_guard.disarm();
+    // Declared after `tx`, so on an error it is dropped first: the file goes
+    // while the row lock is still held, before a waiting upload can move its
+    // own file to the same name.
+    let mut bundle_guard = RemoveOnDrop::new(bundle_root().join(&key));
+
+    // A bundle sealed under a profile key from before a rotation opens for
+    // nobody who holds the current key. That is a browser left open across a
+    // colleague removing somebody: it was launched with the old key and closes
+    // after the new one exists. Refused, so the work stays on that machine
+    // (the agent keeps an unsent session) and goes up sealed under the new key
+    // the next time it is opened.
+    //
+    // FOR SHARE on the organisation's row, so a rotation (FOR UPDATE) cannot
+    // commit between this check and the insert; one that starts after it
+    // sees this row and is refused as incomplete -- its client never re-wrapped
+    // it.
+    if let Some(sealed_under) = key_generation {
+        let current: Option<i32> = sqlx::query_scalar(
+            "SELECT o.ork_generation FROM organizations o \
+             WHERE o.id = (SELECT org_id FROM profiles WHERE id = $1) FOR SHARE",
+        )
+        .bind(profile_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        if let Some(current) = current.filter(|c| sealed_under < *c) {
+            return Err(ApiError::Conflict(format!(
+                "this browser was opened with organisation key generation {sealed_under}, and the \
+                 key has been replaced since (now {current}). What it saved would open for nobody. \
+                 Unlock with your password and open the profile again to send it"
+            )));
+        }
+    }
+
+    sqlx::query(
+        "INSERT INTO bundles (id, profile_id, version, kind, s3_key, size_bytes, sha256,
+                              wrapped_dek, uploaded_by)
+         VALUES ($1, $2, $3, 'snapshot', $4, $5, $6, $7, $8)",
+    )
+    .bind(Uuid::now_v7())
+    .bind(profile_id)
+    .bind(version)
+    .bind(&key)
+    .bind(written as i64)
+    .bind(sha256.as_bytes())
+    .bind(wrapped_key.as_bytes())
+    .bind(caller.user_id)
+    .execute(&mut *tx)
+    .await?;
+    // Old versions go now, inside the same transaction that records the new
+    // one, so a crash between the two cannot leave rows pointing at files that
+    // were already removed.
+    //
+    // The files are removed after the transaction commits, not before: deleting
+    // a file for a transaction that then rolls back would leave a row naming
+    // something that is gone, which is the worse of the two ways to be
+    // inconsistent — a stray file wastes bytes, a missing one loses a profile.
+    let keep = keep_bundle_versions();
+    let mut stale: Vec<String> = Vec::new();
+    if keep > 0 {
+        stale = sqlx::query_scalar(
+            "DELETE FROM bundles WHERE profile_id = $1 AND version <= $2 - $3 RETURNING s3_key",
+        )
+        .bind(profile_id)
+        .bind(version)
+        .bind(keep)
+        .fetch_all(&mut *tx)
+        .await?;
+    }
+
+    sqlx::query("UPDATE profiles SET current_version = $2 WHERE id = $1")
+        .bind(profile_id)
+        .bind(version)
+        .execute(&mut *tx)
+        .await?;
+    tx.commit().await?;
+    bundle_guard.disarm();
+
+    // Now that the rows are gone for good.
+    let mut freed = 0usize;
+    for key in &stale {
+        match std::fs::remove_file(bundle_root().join(key)) {
+            Ok(()) => freed += 1,
+            // Not an error worth failing an upload over: the row is gone, the
+            // allowance is freed, and a file with no row is bytes nobody can
+            // reach. Logged so it can be swept if it ever becomes a pattern.
+            Err(e) => tracing::warn!(error = %e, key, "could not remove an old bundle"),
+        }
+    }
+    if freed > 0 {
+        tracing::info!(%profile_id, freed, keep, "pruned old bundle versions");
+    }
+
+    audit(db.as_mut(), &caller, "bundle.upload", Some(profile_id),
+          json!({ "version": version, "bytes": written, "pruned": freed })).await?;
+
+    Ok(Json(json!({ "version": version })))
+}
+
+/// Fetch the current version.
+async fn download_bundle(
+    mut db: auth::Db,
+    Path(profile_id): Path<Uuid>,
+    request_headers: axum::http::HeaderMap,
+) -> Result<axum::response::Response, ApiError> {
+    // Copied out so that reading it does not borrow the connection: a
+    // handler needs both in the same expression constantly.
+    let caller = db.caller;
+
+    let perms = rbac_guard::permissions_for_profile(db.as_mut(), caller.user_id, profile_id).await?;
+    if perms == PermSet::NONE {
+        return Err(ApiError::NotFound);
+    }
+    if !perms.has(Perm::Launch) {
+        return Err(ApiError::Denied(Perm::Launch));
+    }
+
+    let row: Option<(i32, String, Vec<u8>)> = sqlx::query_as(
+        "SELECT version, s3_key, wrapped_dek FROM bundles
+         WHERE profile_id = $1 ORDER BY version DESC LIMIT 1",
+    )
+    .bind(profile_id)
+    .fetch_optional(db.as_mut())
+    .await?;
+
+    let (version, key, wrapped) = row.ok_or(ApiError::NotFound)?;
+
+    use axum::response::IntoResponse;
+    // The agent says which version it already holds, and a machine that
+    // uploaded a minute ago holds this one. Sending it back meant a team
+    // profile came down whole at every launch -- tens of megabytes on a
+    // tester's profile, 01.10.2026. Written the way the agent writes it
+    // (sync.rs, bundle_etag).
+    let etag = format!("\"v{version}\"");
+    let held = request_headers
+        .get(axum::http::header::IF_NONE_MATCH)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|v| v.split(',').any(|t| t.trim() == etag));
+    if held {
+        let mut response = axum::http::StatusCode::NOT_MODIFIED.into_response();
+        response.headers_mut().insert("x-fury-version", version.to_string().parse().unwrap());
+        response.headers_mut().insert(axum::http::header::ETAG, etag.parse().unwrap());
+        return Ok(response);
+    }
+
+    let path = bundle_root().join(&key);
+    // The row and the bytes are in different places, so they can disagree: a
+    // restore that brought back the database but not the disk, or a server
+    // started with a different FURY_BUNDLE_DIR than the one that wrote them.
+    // Both happen, and "No such file or directory" with no path in it is a
+    // 500 that tells the operator nothing about which of the two it was.
+    let bytes = std::fs::read(&path).map_err(|e| {
+        ApiError::Internal(anyhow::anyhow!(
+            "the database has version {version} of this profile but its bundle is not at {} ({e}). \
+             Either FURY_BUNDLE_DIR points somewhere other than where it was written, or the \
+             bundle directory was not restored with the database",
+            path.display()
+        ))
+    })?;
+
+    let mut response = bytes.into_response();
+    let headers = response.headers_mut();
+    headers.insert("x-fury-version", version.to_string().parse().unwrap());
+    headers.insert(axum::http::header::ETAG, etag.parse().unwrap());
+    headers.insert(
+        "x-fury-wrapped-key",
+        String::from_utf8_lossy(&wrapped).parse().unwrap(),
+    );
+    Ok(response)
+}
+
+async fn heartbeat(
+    mut db: auth::Db,
+    Path(profile_id): Path<Uuid>,
+    Json(body): Json<serde_json::Value>,
+) -> ApiResult<Json<serde_json::Value>> {
+    // Copied out so that reading it does not borrow the connection: a
+    // handler needs both in the same expression constantly.
+    let caller = db.caller;
+
+    let token = body
+        .get("lock_token")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| ApiError::BadRequest("lock_token is required".into()))?;
+
+    // Matched on the token, not just the user: an agent whose lock was
+    // force-released must not be able to extend it back into existence.
+    let updated = sqlx::query(
+        "UPDATE profile_locks SET expires_at = now() + interval '90 seconds' \
+         WHERE profile_id = $1 AND user_id = $2 AND token_hash = $3",
+    )
+    .bind(profile_id)
+    .bind(caller.user_id)
+    .bind(auth::hash_token(token))
+    .execute(db.as_mut())
+    .await?;
+
+    if updated.rows_affected() == 0 {
+        return Err(ApiError::Conflict(
+            "this lock is no longer yours; stop and re-acquire before uploading".into(),
+        ));
+    }
+    Ok(Json(json!({ "ok": true })))
+}
+
+async fn release_lock(
+    mut db: auth::Db,
+    Path(profile_id): Path<Uuid>,
+    Json(body): Json<serde_json::Value>,
+) -> ApiResult<Json<serde_json::Value>> {
+    // Copied out so that reading it does not borrow the connection: a
+    // handler needs both in the same expression constantly.
+    let caller = db.caller;
+
+    // Matched on the token, like the heartbeat, and not on the user alone.
+    //
+    // One person signed in on two machines is the ordinary case here — a laptop
+    // and a desktop — and deleting by user id meant closing a profile on one of
+    // them released the lock held by the other, where the browser was still
+    // running and still writing cookies. The next colleague to ask would be
+    // handed a profile that was in use.
+    let token = body
+        .get("lock_token")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| ApiError::BadRequest("lock_token is required".into()))?;
+
+    sqlx::query("DELETE FROM profile_locks WHERE profile_id = $1 AND token_hash = $2")
+        .bind(profile_id)
+        .bind(auth::hash_token(token))
+        .execute(db.as_mut())
+        .await?;
+
+    // No error when nothing was deleted: the caller asked not to be holding
+    // this profile, and after a force-release or a lapse they already are not.
+    // Failing here would leave a client unable to tidy up after itself.
+    audit(db.as_mut(), &caller, "profile.stop", Some(profile_id), json!({})).await?;
+    Ok(Json(json!({ "ok": true })))
+}
+
+// ---------------------------------------------------------------------------
+
+/// Appends to the audit log. Failures are logged, never propagated: losing an
+/// audit row must not fail the operation the user asked for, and the row is
+/// append-only by grant, so it cannot be rewritten afterwards either.
+/// Write an audit row on the caller's own connection.
+///
+/// Takes the connection rather than the pool because audit_events is under a
+/// policy now: a row written from an unbound connection is refused, and one
+/// written from somebody else's would carry the wrong org_id past the check.
+pub(crate) async fn audit(
+    db: &mut sqlx::PgConnection,
+    caller: &Caller,
+    action: &str,
+    target: Option<Uuid>,
+    detail: serde_json::Value,
+) -> ApiResult<()> {
+    if let Err(e) = sqlx::query(
+        "INSERT INTO audit_events (org_id, actor_user_id, action, target_id, detail) \
+         VALUES ($1, $2, $3, $4, $5)",
+    )
+    .bind(caller.org_id)
+    .bind(caller.user_id)
+    .bind(action)
+    .bind(target)
+    .bind(detail)
+    .execute(db)
+    .await
+    {
+        tracing::error!(error = %e, action, "audit write failed");
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn masked_hosts_stay_distinguishable_but_unusable() {
+        // An operator must be able to tell two proxies apart without being able
+        // to reuse either.
+        let a = mask_host("res-eu-01.provider.net");
+        let b = mask_host("res-us-02.provider.net");
+        // Two exits from one provider is the ordinary case, and the first
+        // version of this collapsed them onto the same string.
+        assert_ne!(a, b);
+        assert!(!a.contains("eu-01"));
+        assert!(!b.contains("us-02"));
+        assert!(a.ends_with(".provider.net"));
+        // Stable, or the list would appear to change on every refresh.
+        assert_eq!(a, mask_host("res-eu-01.provider.net"));
+    }
+
+    #[test]
+    fn masking_handles_hosts_without_a_dot() {
+        assert!(mask_host("localhost").starts_with("***"));
+        assert!(mask_host("ab.example.com").ends_with(".example.com"));
+        assert!(!mask_host("ab.example.com").starts_with("ab***"));
+    }
+
+    fn scratch(name: &str) -> std::path::PathBuf {
+        let d = std::env::temp_dir().join(format!("fury-server-{}-{name}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    #[test]
+    fn an_upload_that_does_not_stand_takes_its_file_with_it() {
+        let d = scratch("guard");
+        let (dropped, kept) = (d.join(".incoming-a"), d.join("6.bundle"));
+        std::fs::write(&dropped, "x").unwrap();
+        std::fs::write(&kept, "x").unwrap();
+        {
+            // An early return, as on a 409: nothing disarms it.
+            let _g = RemoveOnDrop::new(dropped.clone());
+        }
+        {
+            let mut g = RemoveOnDrop::new(kept.clone());
+            g.disarm();
+        }
+        assert!(!dropped.exists(), "the refused upload stayed on disk");
+        assert!(kept.exists(), "a committed bundle was removed");
+        // A file already moved away is not an error.
+        drop(RemoveOnDrop::new(d.join("never-existed")));
+        std::fs::remove_dir_all(&d).unwrap();
+    }
+
+    #[test]
+    fn the_startup_sweep_takes_only_dead_uploads() {
+        let root = scratch("sweep");
+        let p = root.join("0194b3c0-0000-7000-8000-000000000001");
+        std::fs::create_dir_all(&p).unwrap();
+        for f in [".incoming-old", ".incoming-live", "3.bundle"] {
+            std::fs::write(p.join(f), "x").unwrap();
+        }
+        let hour_ago = std::time::SystemTime::now() - std::time::Duration::from_secs(7200);
+        for f in [".incoming-old", "3.bundle"] {
+            std::fs::File::options().write(true).open(p.join(f)).unwrap().set_modified(hour_ago).unwrap();
+        }
+        // A stray file at the top level is not a profile directory.
+        std::fs::write(root.join(".incoming-top"), "x").unwrap();
+
+        assert_eq!(sweep_abandoned_uploads(&root, std::time::Duration::from_secs(3600)), 1);
+        assert!(!p.join(".incoming-old").exists());
+        assert!(p.join(".incoming-live").exists(), "an upload still being written was removed");
+        assert!(p.join("3.bundle").exists(), "a bundle is never the sweep's to judge");
+        assert!(root.join(".incoming-top").exists());
+        assert_eq!(sweep_abandoned_uploads(&root.join("missing"), std::time::Duration::ZERO), 0);
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+}

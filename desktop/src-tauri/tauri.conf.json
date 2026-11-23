@@ -1,0 +1,79 @@
+{
+  "$schema": "../node_modules/@tauri-apps/cli/config.schema.json",
+  "productName": "Fury",
+  "identifier": "dev.fury.desktop",
+  "build": {
+    "devUrl": "http://localhost:5273",
+    "frontendDist": "../dist",
+    "beforeDevCommand": "npm run dev",
+    "beforeBuildCommand": "node scripts/sidecar.mjs && npm run build"
+  },
+  "app": {
+    "windows": [
+      {
+        "label": "main",
+        "title": "Fury",
+        "width": 1280,
+        "height": 800,
+        "minWidth": 900,
+        "minHeight": 560,
+        "resizable": true
+      }
+    ],
+    "security": {
+      "csp": "default-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src ipc: http://ipc.localhost; object-src 'none'; base-uri 'none'; form-action 'none'",
+      "freezePrototype": true
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": [
+      "app",
+      "dmg",
+      "nsis"
+    ],
+    "icon": [
+      "icons/32x32.png",
+      "icons/128x128.png",
+      "icons/128x128@2x.png",
+      "icons/icon.icns",
+      "icons/icon.ico"
+    ],
+    "copyright": "Fury Browser contributors",
+    "category": "Utility",
+    "shortDescription": "Anti-detect browser for teams",
+    "longDescription": "Self-hosted anti-detect browser with projects, per-project access grants and a shared profile lock.",
+    "macOS": {
+      "minimumSystemVersion": "10.15"
+    },
+    "externalBin": [
+      "binaries/fury-agent"
+    ],
+    "windows": {
+      "nsis": {
+        "installerIcon": "icons/icon.ico",
+        "headerImage": "installer/header.bmp",
+        "sidebarImage": "installer/sidebar.bmp",
+        "installMode": "currentUser",
+        "languages": [
+          "Russian",
+          "English"
+        ],
+        "displayLanguageSelector": true,
+        "installerHooks": "installer/hooks.nsh",
+        "uninstallerIcon": "icons/icon.ico"
+      }
+    }
+  },
+  "plugins": {
+    "updater": {
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDk2NTlERjA2QzE0MEU3NUYKUldSZjUwREJCdDlabGpYQ2s5VzJsVXgrcEFGYkh1aHpiVjNlM05ZNE9JQzFuZHFvb0o3Q1NydDgK",
+      "endpoints": [
+        "https://github.com/furyteamtop/fury-antidetect-browser/releases/latest/download/latest.json"
+      ],
+      "windows": {
+        "installMode": "passive"
+      }
+    }
+  }
+}

@@ -1,0 +1,18 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// Copyright 2026 Bogdan Shapovalov and the Fury authors
+
+fn main() {
+    let text = std::fs::read_to_string(std::env::args().nth(1).unwrap()).unwrap();
+    let p: fury_shared::Persona = serde_json::from_str(&text).unwrap();
+    p.validate().expect("persona is inconsistent");
+    let ctx = fury_shared::ProfileContext {
+        timezone: "America/New_York".into(),
+        languages: vec!["en-US".into(), "en".into()],
+        ui_locale: "en-US".into(),
+        geolocation: Some((52.52, 13.405)),
+        chrome_major: 155,
+        chrome_full_version: "155.0.8059.39".into(),
+    };
+    let seed: u64 = std::env::args().nth(2).unwrap().parse().unwrap();
+    println!("{}", serde_json::to_string_pretty(&p.derive_core_config(seed, &ctx)).unwrap());
+}

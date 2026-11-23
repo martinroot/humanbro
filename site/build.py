@@ -1,0 +1,278 @@
+#!/usr/bin/env python3
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright 2026 Bogdan Shapovalov and the Fury authors
+"""Build the landing page from what the repository actually says.
+
+    ./build.py            write dist/
+    ./build.py --check    render without writing, and fail if the page cannot
+                          be built from the repository as it stands (for CI)
+
+WHY A BUILD STEP FOR ONE PAGE. The page makes numbers its argument — the
+Chromium major we are on, how many patches carry the spoofing, how many
+machines are in the catalogue — and a number typed into HTML by hand is a
+number that goes stale the week after somebody reads it. Every one of them
+is read here from the file that owns it: core/CHROMIUM_VERSION, the patch
+series, the persona catalogue, the workspace version. Change the thing and
+the page changes; there is no second place to remember.
+
+WHAT IS NOT BUILT IN. The competitors' versions come from competitors.json,
+which a person edits after measuring, and the page prints the date beside
+them. They cannot be polled: they are closed products, and a page that
+claimed to know today's Multilogin build would be the one lie on a site
+whose whole argument is that it does not ask to be believed.
+
+WHAT THE PAGE DOES POLL, in the browser, at load: the latest release on
+GitHub, so the download links and the version shown are right even for a
+deploy that happened before the release did. It fails silently to what was
+built in, because a landing page that breaks when api.github.com is slow is
+worse than one whose version is a day old.
+"""
+
+import datetime
+import json
+import os
+import pathlib
+import re
+import shutil
+import subprocess
+import sys
+
+HERE = pathlib.Path(__file__).resolve().parent
+ROOT = HERE.parent
+DIST = HERE / "dist"
+
+REPO = "furyteamtop/fury-antidetect-browser"
+# The partner link the application itself opens (desktop/src/components/Partner.tsx).
+PROXY_URL = "https://proxys.io/?refid=278406"
+
+
+def chromium_version() -> str:
+    """The pin the core is built from. `\\r` stripped: the Windows checkout is
+    CRLF and this file is read on both machines."""
+    return (ROOT / "core" / "CHROMIUM_VERSION").read_text().replace("\r", "").strip()
+
+
+def app_version() -> str:
+    m = re.search(r'(?m)^\[workspace\.package\](?:.|\n)*?^version = "([^"]+)"',
+                  (ROOT / "Cargo.toml").read_text())
+    if not m:
+        raise SystemExit("no workspace version in Cargo.toml")
+    return m.group(1)
+
+
+def patch_count() -> int:
+    """Lines of the series that name a patch.
+
+    The '!' marker is stripped BEFORE the name is looked at, the way
+    core/build/apply.sh does it. Checking `.patch` on the raw token instead
+    silently missed all five patches that carry the marker — the page said 23
+    where the series has 28, and 0001 among the missing, which is the one
+    every other patch depends on. The same off-by-the-marker mistake apply.sh
+    has its own comment about."""
+    series = (ROOT / "core" / "patches" / "series").read_text().splitlines()
+    n = 0
+    for line in series:
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        name = line.split()[0].rstrip("!")
+        if name.endswith(".patch"):
+            n += 1
+    return n
+
+
+def persona_count() -> int:
+    """Variants expanded from the two measured bases, plus whole machines
+    somebody sent in. The same arithmetic `catalogue::all()` does."""
+    cat = (ROOT / "shared-rs" / "src" / "catalogue.rs").read_text()
+    variants = len(re.findall(r"(?m)^    Variant \{", cat))
+    contributed = len(list((ROOT / "shared" / "personas" / "contributed").glob("*.json")))
+    return variants + contributed
+
+
+def gate_checks() -> int:
+    """How many claims the release gate makes. Printed as "13 of 13" on the
+    page, so it is read rather than remembered."""
+    src = (ROOT / "tools" / "detect-suite" / "src" / "main.rs").read_text()
+    m = re.search(r"gate has thirteen checks", src)
+    # The count lives in status.py's assertion; read that instead of guessing.
+    status = (ROOT / "tools" / "detect-suite" / "status.py").read_text()
+    m = re.search(r"len\(gate_rows\) != (\d+)", status)
+    return int(m.group(1)) if m else 13
+
+
+def commit() -> str:
+    try:
+        return subprocess.run(["git", "-C", str(ROOT), "rev-parse", "--short", "HEAD"],
+                              capture_output=True, text=True, check=True).stdout.strip()
+    except Exception:
+        return "unknown"
+
+
+def competitors():
+    data = json.loads((HERE / "competitors.json").read_text())
+    return data["measured"], data["rows"]
+
+
+def table_rows(rows, ours_major, lang):
+    """One <tr> per product. Ours is marked, and the bar is drawn from the
+    major itself so that "ahead" is visible without reading the number."""
+    words = {
+        "ru": {"yes": "есть", "no": "нет", "launcher": "лончер", "core": "ядро",
+               "free": "бесплатно", "paid": "подписка", "stalled": "остановился"},
+        "en": {"yes": "yes", "no": "no", "launcher": "launcher", "core": "core",
+               "free": "free", "paid": "subscription", "stalled": "stalled"},
+    }[lang]
+    # Ours comes from core/CHROMIUM_VERSION, never from the file a person
+    # edits: the 22.09 page said 153 for a week after the core moved to 155.
+    rows = [dict(r, chrome=ours_major) if r.get("self") else r for r in rows]
+    # The scale is Chromium's. Firefox has its own numbers: Camoufox on 158 would
+    # stretch the scale and draw Firefox ahead of a Chrome it cannot be compared
+    # with, so a row with another engine prints its version and no bar.
+    chromium = [r for r in rows if not r.get("engine")]
+    lo = min(r["chrome"] for r in chromium)
+    hi = max(r["chrome"] + 1 for r in chromium)
+    out = []
+    for r in rows:
+        bar = ""
+        if not r.get("engine"):
+            width = round(100 * (r["chrome"] - lo + 1) / (hi - lo), 1)
+            bar = f'<span class="barv" style="width:{width}%"></span>'
+        name = r["name"]
+        if r.get("engine"):
+            name += f' <span class="dim">({r["engine"]})</span>'
+        if r.get("stalled"):
+            name += f' <span class="dim">— {words["stalled"]}</span>'
+        cls = " class=\"ours\"" if r.get("self") else ""
+        out.append(
+            f'<tr{cls}><th scope="row">{name}</th>'
+            f'<td class="ver">{bar}'
+            f'<span class="num">{r["chrome"]}</span></td>'
+            f'<td>{words[r["teams"]]}</td>'
+            f'<td>{words[r["open"]]}</td>'
+            f'<td>{words[r["price"]]}</td></tr>'
+        )
+    return "\n".join(out)
+
+
+def main() -> int:
+    check = "--check" in sys.argv
+
+    chromium = chromium_version()
+    major = chromium.split(".")[0]
+    measured, rows = competitors()
+    d, m, y = measured.split("-")[2], measured.split("-")[1], measured.split("-")[0]
+
+    values = {
+        "CHROMIUM": chromium,
+        "CHROME_MAJOR": major,
+        "VERSION": app_version(),
+        "PATCHES": str(patch_count()),
+        "PERSONAS": str(persona_count()),
+        "GATE": str(gate_checks()),
+        "REPO": REPO,
+        "PROXY_URL": PROXY_URL,
+        "COMMIT": commit(),
+        "BUILT": datetime.date.today().isoformat(),
+    }
+    per_language = {
+        "ru": {"MEASURED": f"{d}.{m}.{y}", "ROWS": table_rows(rows, int(major), "ru")},
+        "en": {"MEASURED": datetime.date.fromisoformat(measured).strftime("%d %B %Y"),
+               "ROWS": table_rows(rows, int(major), "en")},
+    }
+    copy = json.loads((HERE / "copy.json").read_text())
+    if copy.keys() != per_language.keys():
+        raise SystemExit(f"copy.json has {sorted(copy)}, the build knows {sorted(per_language)}")
+    if copy["en"].keys() != copy["ru"].keys():
+        raise SystemExit(f"copy.json keys differ: {sorted(copy['en'].keys() ^ copy['ru'].keys())}")
+
+    # One piece of markup, once per language: a key missing from copy.json is a
+    # refused build rather than a double bracket in front of a reader.
+    page = (HERE / "index.html").read_text()
+    m_body = re.search(r"<!-- BODY -->\n(.*?)<!-- /BODY -->\n", page, re.S)
+    if not m_body:
+        raise SystemExit("index.html has no BODY markers")
+    body = m_body.group(1)
+    blocks = []
+    # English first and visible: the first paint and the no-script page.
+    for lang in ("en", "ru"):
+        words = copy[lang]
+        def word(found, words=words):
+            if found.group(1) not in words:
+                raise SystemExit(f"index.html asks for [[{found.group(1)}]], copy.json has none")
+            return words[found.group(1)]
+        text = re.sub(r"\[\[([\w.]+)\]\]", word, body)
+        text = text.replace("{{LANG}}", lang)
+        for k, v in per_language[lang].items():
+            text = text.replace("{{" + k + "}}", v)
+        hidden = "" if lang == "en" else " hidden"
+        blocks.append(
+            f'<div class="langblock" data-block="{lang}"'
+            f' data-own-canvas="{words["bench.ownCanvas"]}" data-no-value="{words["bench.none"]}"{hidden}>\n'
+            f'{text}</div>\n')
+    page = page[:m_body.start()] + "".join(blocks) + page[m_body.end():]
+    # Every number and link, now that the words are in. Twice over nothing: copy.json
+    # uses the same placeholders, and they are all in the page by this point.
+    missing = {m for m in re.findall(r"\{\{(\w+)\}\}", page)} - values.keys()
+    if missing:
+        raise SystemExit(f"the template asks for values nothing provides: {sorted(missing)}")
+    for k, v in values.items():
+        page = page.replace("{{" + k + "}}", v)
+
+    out = DIST / "index.html"
+    if check:
+        # NOT a comparison against a committed dist/, which is what this used
+        # to be and could never have passed: two of the values are COMMIT and
+        # today's date, so a built page is stale the moment it is committed and
+        # again every midnight. The status page learned this the expensive way
+        # (679245d) — its footer named the commit that had not happened yet.
+        #
+        # What CI can honestly check is that the page still builds out of the
+        # repository: every placeholder answered, and every number that is read
+        # rather than typed actually read. A regex here matching nothing is the
+        # real failure — PATCHES silently said 23 for a 28-patch series once —
+        # and it shows up as a zero, so zero is refused.
+        bad = [k for k in ("CHROMIUM", "VERSION", "PATCHES", "PERSONAS", "GATE")
+               if not values[k] or values[k] == "0"]
+        if bad:
+            print(f"!! read nothing for: {', '.join(bad)} — a source file moved "
+                  f"or a regex in this script stopped matching", file=sys.stderr)
+            return 1
+        if not all(v["ROWS"].strip() for v in per_language.values()):
+            print("!! the comparison table came out empty", file=sys.stderr)
+            return 1
+        print(f"the page builds: Chromium {values['CHROMIUM']}, "
+              f"{values['PATCHES']} patches, {values['PERSONAS']} personas, "
+              f"gate of {values['GATE']}, {len(page):,} bytes")
+        return 0
+
+    DIST.mkdir(exist_ok=True)
+    out.write_text(page)
+    # The images travel with the page — a landing that hotlinks its own logo
+    # out of a git host breaks when that host rate-limits it — and they are
+    # resized on the way. The originals are 1920px and 1024px: 1.6 MB of PNG
+    # to draw a 40px wordmark and a favicon, which is most of the page's
+    # weight for none of its meaning. `sips` ships with macOS; where it does
+    # not, the full-size file is copied and the page still works.
+    for src, dst, px in ((ROOT / "assets" / "logo-dark.png", DIST / "logo.png", 520),
+                         (ROOT / "assets" / "icon.png", DIST / "icon.png", 96)):
+        shutil.copy(src, dst)
+        if shutil.which("sips"):
+            subprocess.run(["sips", "-Z", str(px), str(dst)],
+                           capture_output=True, check=False)
+    # The capture page, at /probe/: what a phone opens to become a persona
+    # (docs/18). The same files GitHub Pages serves; on our own name it is a
+    # link a person sending their phone's capture is more willing to open.
+    probe = DIST / "probe"
+    probe.mkdir(exist_ok=True)
+    suite = ROOT / "tools" / "detect-suite"
+    shutil.copy(suite / "probe.html", probe / "index.html")
+    for name in ("probe.js", "sw-probe.js"):
+        shutil.copy(suite / name, probe / name)
+    total = sum(f.stat().st_size for f in DIST.rglob("*") if f.is_file())
+    print(f"wrote {out} ({len(page):,} bytes); dist is {total/1024:.0f} KB in {len(list(DIST.iterdir()))} files")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

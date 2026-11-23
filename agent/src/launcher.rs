@@ -1,0 +1,755 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// Copyright 2026 Bogdan Shapovalov and the Fury authors
+
+//! Launching the patched core.
+//!
+//! # Why the fingerprint config is not passed on the command line
+//!
+//! Process arguments are readable by any other process on the machine (`ps`,
+//! Process Explorer, and any native helper an anti-fraud vendor ships). A
+//! command line containing the whole spoofed persona is a gift. The config
+//! travels over an inherited pipe instead; only the descriptor number appears
+//! in the arguments.
+
+use std::path::{Path, PathBuf};
+use std::process::Stdio;
+
+use fury_platform::Carrier;
+
+use fury_shared::rbac::LaunchRestrictions;
+
+#[derive(Debug, thiserror::Error)]
+pub enum LaunchError {
+    #[error("fingerprint config is inconsistent and would be a detection signal:\n{0}")]
+    Inconsistent(String),
+    #[error("core binary not found at {0}")]
+    CoreMissing(PathBuf),
+    #[error(transparent)]
+    Io(#[from] std::io::Error),
+}
+
+pub struct LaunchSpec<'a> {
+    pub core_binary: &'a Path,
+    pub user_data_dir: &'a Path,
+
+    /// The **core's** config, as produced by `Persona::derive_core_config`.
+    ///
+    /// Not `FingerprintConfig`. The two are different shapes and were never
+    /// convertible: the core reads dotted camelCase paths — `audio.sampleRate`,
+    /// `noise.canvasSeed`, `gpu.webglParams.RENDERER`, `clientHints.brands` —
+    /// while `FingerprintConfig` is snake_case and has no client-hints or
+    /// webglParams section at all. Handing it the wrong one is worse than
+    /// handing it nothing: every lookup misses, every vector silently falls back
+    /// to stock Chromium, and the profile *looks* configured. The contract is
+    /// pinned by `core_config_covers_every_key_the_core_reads` in shared-rs.
+    pub config: &'a serde_json::Value,
+    pub relay_port: u16,
+    pub restrictions: LaunchRestrictions,
+    pub start_urls: &'a [String],
+    /// Unpacked extension directories to load, already installed by `ext`.
+    ///
+    /// Empty for a profile with none, and then neither switch is passed at
+    /// all — `--load-extension=` with nothing after it is not the same as
+    /// absent, and the empty form makes Chromium log a warning on every start.
+    pub extensions: &'a [std::path::PathBuf],
+    /// Only set when the caller is allowed CDP at all; see `LaunchRestrictions`.
+    pub debug_port: Option<u16>,
+
+    /// Open behind the person's work instead of on top of it: MCP's background
+    /// start, for a profile a script drives while somebody uses the machine.
+    /// See the switches in `build_args` and patch 0305.
+    pub background: bool,
+
+    /// No window at all. Never for a profile somebody browses with: a headless
+    /// Chrome differs from a windowed one in ways a site can measure. It is for
+    /// the agent's own errands on a directory no page is loaded in, which today
+    /// is one: moving a jar onto the profile's key before an upload (rekey.rs).
+    pub headless: bool,
+
+    /// The key the core encrypts this profile's cookies with, or `None` to
+    /// leave that to the machine's own keychain.
+    ///
+    /// Present for every profile that has one, which after patch 0110 is every
+    /// profile. The point is that it does NOT come from this machine: it is
+    /// derived from the profile's own key material, so the ciphertext in the
+    /// cookie jar can be read wherever the bundle can be opened. Without it, a
+    /// colleague unpacking a shared profile cannot decrypt its cookies — and
+    /// Chromium answers that by DELETING them, then Fury packs the empty jar
+    /// and pushes it.
+    ///
+    /// Travels on its own descriptor, not in the fingerprint config: that
+    /// config is republished into shared memory for every child process,
+    /// renderers included, and the renderer is the one process on the machine
+    /// that runs the visited site's code.
+    pub os_crypt_key: Option<[u8; 32]>,
+
+    /// The UI locale, one of Chrome's shipped ones. See `fury_shared::locale`.
+    ///
+    /// This is what makes `Intl.DateTimeFormat().resolvedOptions().locale`,
+    /// `toLocaleString`, collation and every other ICU-backed answer agree with
+    /// the languages the profile announces — and it needs no patch, because
+    /// `--lang` is the switch Chrome already uses for exactly this. Measured
+    /// against the captures in tools/detect-suite/baselines: a real Chrome
+    /// answering `navigator.languages = ru-RU,ru,en-US,en` reports `locale.locale
+    /// = ru`, and so does AdsPower. The UI locale IS the Intl locale.
+    ///
+    /// It has to be a shipped locale. ResourceBundle finds no .pak for anything
+    /// else and quietly falls back to en-US, which would leave a profile
+    /// announcing German and formatting numbers in English.
+    pub ui_locale: &'a str,
+
+    /// (profile id, profile name): on macOS the core runs from a copy named
+    /// after the profile, so the Dock says which account it is (dock.rs).
+    /// None runs the core as it is, and the Dock says Fury.
+    pub dock_name: Option<(&'a str, &'a str)>,
+}
+
+/// Build the argument vector for the core.
+///
+/// Split out from spawning so it can be unit-tested — a missing hardening flag
+/// is a silent security regression otherwise.
+///
+/// Everything except the two carrier switches, which name a slot that does not
+/// exist until the carrier does. Those come from `carrier_switches`.
+/// Tells Chromium the last session ended cleanly, so `--restore-last-session`
+/// is honoured.
+///
+/// Chromium never restores a session after an unclean exit: it reads
+/// `profile.exit_type` from the profile's Preferences, and when that says
+/// "Crashed" it opens a fresh window with a "Restore pages?" prompt instead
+/// (startup_browser_creator_impl.cc, "could cause a crash loop"). Every way a
+/// Fury browser can end other than closing its own window leaves "Crashed":
+/// the agent killing it after ten seconds of WM_CLOSE, Fury quitting, the
+/// machine shutting down. Measured 17.11.2026 on Windows, core 157: four tabs,
+/// the process killed, relaunched: one tab, the start page. The same tabs
+/// closed cleanly came back. Reported the same day as "close it and the tabs
+/// are gone".
+///
+/// Only "Crashed" is touched; the file is left as it is otherwise, and a file
+/// that cannot be read or parsed is left alone: the browser then behaves as
+/// before, which is a missing tab, not a broken profile.
+pub fn forget_unclean_exit(user_data_dir: &Path) -> bool {
+    let path = user_data_dir.join("Default").join("Preferences");
+    let Ok(text) = std::fs::read_to_string(&path) else { return false };
+    let Ok(mut prefs) = serde_json::from_str::<serde_json::Value>(&text) else { return false };
+    let Some(profile) = prefs.get_mut("profile").and_then(|p| p.as_object_mut()) else { return false };
+    if profile.get("exit_type").and_then(|v| v.as_str()) != Some("Crashed") {
+        return false;
+    }
+    profile.insert("exit_type".into(), serde_json::json!("Normal"));
+    profile.insert("exited_cleanly".into(), serde_json::json!(true));
+    let Ok(out) = serde_json::to_vec(&prefs) else { return false };
+    // Write beside it and rename, so a failure halfway leaves the old file.
+    let tmp = path.with_extension("fury-tmp");
+    std::fs::write(&tmp, out).and_then(|_| std::fs::rename(&tmp, &path)).is_ok()
+}
+
+pub fn build_args(spec: &LaunchSpec) -> Vec<String> {
+    let mut args = vec![
+        format!("--user-data-dir={}", spec.user_data_dir.display()),
+        // Everything goes through the relay. No exceptions, no bypass list:
+        // an entry in --proxy-bypass-list is a direct connection from the real IP.
+        format!("--proxy-server=http://127.0.0.1:{}", spec.relay_port),
+        "--proxy-bypass-list=<-loopback>".to_string(),
+        "--no-default-browser-check".to_string(),
+        "--no-first-run".to_string(),
+        // Reopen what was open. Chromium was already SAVING the session — the
+        // Sessions directory has files in it after every close — and simply
+        // never restoring it, so a profile came back as a blank new tab and the
+        // work of the last session had to be found again from history.
+        //
+        // Measured 03.08.2026 on a throwaway directory: two tabs open, SIGTERM,
+        // relaunch — one chrome://newtab and nothing else. With this switch the
+        // same test brings both tabs back.
+        //
+        // A switch rather than the session.restore_on_startup preference: the
+        // preference lives in the profile and the operator can change it in
+        // Settings, and a profile that quietly stopped restoring because
+        // somebody clicked something would be hard to explain. This is a
+        // property of how Fury opens a profile, so it belongs in argv.
+        //
+        // Bookmarks needed nothing: the user-data-dir is stable per profile
+        // (paths::profile_dir) and Chromium writes Default/Bookmarks into it,
+        // so they were already surviving. They LOOKED lost because the window
+        // came back empty.
+        "--restore-last-session".to_string(),
+        // Anything that phones home outside the profile proxy is a real-IP leak.
+        "--disable-background-networking".to_string(),
+        // --disable-component-update is NOT here, and its absence is load-bearing.
+        //
+        // It was, and it broke Widevine on every profile. bundle_widevine_cdm
+        // puts the CDM inside the app bundle, but Chromium REGISTERS it through
+        // the component updater's registration path — so with updates disabled
+        // the blob sits there and nothing ever tells the browser about it.
+        // Measured 02.08.2026: the same binary answers
+        // requestMediaKeySystemAccess("com.widevine.alpha") with "available"
+        // when launched directly and NotSupportedError when launched with this
+        // switch, and removing it from the launcher's own argument set is enough
+        // to bring it back. It was the one gate check failing.
+        //
+        // That cost every profile Netflix, Spotify and Disney+, and it cost the
+        // thing the gate exists to protect: real Chrome accepts Widevine, and a
+        // browser that refuses it is a browser that is not Chrome.
+        //
+        // What it bought, measured the same day: nothing. With the switch and
+        // without it, a browser left alone for 90 seconds opens connections to
+        // the same set of Google addresses. And under Fury every one of those
+        // goes through the relay, because --proxy-server points at it and the
+        // loopback bypass is removed — so the question was never whether the
+        // browser talks, only whose address it talks from.
+        "--disable-domain-reliability".to_string(),
+        "--disable-breakpad".to_string(),
+        "--safebrowsing-disable-auto-update".to_string(),
+        // QUIC would carry UDP straight past an HTTP relay.
+        "--disable-quic".to_string(),
+        // WebRTC used to be handled here, by a switch, and the switch did
+        // nothing at all.
+        //
+        // The reasoning was right: WebRTC gathers ICE candidates on its own
+        // sockets, past the relay, so a page opening a peer connection reads the
+        // machine's real address — identifying the proxy as a proxy AND handing
+        // every profile on the machine the same address, which clusters exactly
+        // the accounts the product exists to keep apart.
+        //
+        // What was wrong was believing --force-webrtc-ip-handling-policy did
+        // something about it. In M150 that switch is read by
+        // content/shell/browser/shell.cc and by browser tests; nothing in
+        // //chrome reads it. Chrome takes the value from a profile preference.
+        // Measured 02.08.2026 with the switch present: a page still received an
+        // srflx candidate carrying this machine's real public address.
+        //
+        // Now patch 0070, which overrides the preference itself. Nothing to
+        // pass here — and that is the point: a switch is visible in `ps` to any
+        // process on the machine, a preference is not.
+        // Turn off Chromium's field-trial testing config.
+        //
+        // Not a tuning knob — a divergence from real Chrome that our own build
+        // settings create. `is_chrome_branded = false` means GOOGLE_CHROME_
+        // BRANDING is off, and `ShouldUseFieldTrialTestingConfig`
+        // (variations_field_trial_creator.cc:142) then applies
+        // testing/variations/fieldtrial_testing_config.json by default. That
+        // file force-enables features real stable Chrome ships disabled —
+        // `ReduceAcceptLanguage` and `ReduceAcceptLanguageHTTP` among them, on
+        // mac and windows both, and those two cut Accept-Language down to a
+        // single language. A browser announcing four languages in JS and one in
+        // its headers contradicts itself, and it took reading the build config
+        // to find, because nothing about it is visible in the source of the
+        // patches.
+        //
+        // Also set as `disable_fieldtrial_testing_config = true` in core/args.
+        // One decision, stated where it belongs and again where it takes effect
+        // today: the GN flag is right and needs a rebuild, and this switch works
+        // on the binaries that already exist.
+        "--disable-field-trial-config".to_string(),
+        // The Intl locale, and the browser's own UI language with it — which is
+        // the honest pairing. A German exit whose menus are in German and whose
+        // dates format in German is a German install; one that formats dates in
+        // English is a spoof with a seam.
+        //
+        // Reaches every renderer without a patch: the browser turns --lang into
+        // the kApplicationLocale pref (chrome_command_line_pref_store.cc:50),
+        // hands it back down to each child (render_process_host_impl.cc:3734),
+        // and each child calls SetICUDefaultLocale with it
+        // (chrome_main_delegate.cc:1449 via l10n_util.cc:591). V8 reads the ICU
+        // default for Intl (isolate.cc:8025). Nothing overrides it on either
+        // platform we ship: OverrideLocaleWithCocoaLocale is never called in
+        // Chrome, and the Windows path tries --lang before the UI language list.
+        format!("--lang={}", spec.ui_locale),
+    ];
+
+    // Windows: never let the browser relaunch itself (issue 38).
+    //
+    // A browser started elevated while UAC is on restarts itself through
+    // Explorer as the plain user (MaybeAutoDeElevate, chrome_main_delegate.cc)
+    // and exits. The new process is Explorer's child, not ours, so it inherits
+    // none of our handles: the config slot named by --fury-fp-file-handle is
+    // empty there, and patch 0001 stops it on purpose. Seen in a tester's
+    // dumps: the relaunched command line ends in --do-not-de-elevate, which
+    // Chrome appends itself; LastError 6 on the read, no File handle with that
+    // number in the process. It happens whenever Fury runs "as administrator",
+    // which is why it came and went for him. The browser keeps the rights the
+    // agent has; one that loses its persona is the worse outcome.
+    #[cfg(windows)]
+    args.push("--do-not-de-elevate".to_string());
+
+    // Extensions, and the pair is not decoration.
+    //
+    // `--load-extension` on its own has been progressively restricted upstream
+    // on the argument that a silently side-loaded extension is an attack; the
+    // pairing with `--disable-extensions-except` is what current Chrome
+    // accepts. Both switches take the same list.
+    //
+    // NOT VERIFIED against a built core. This is a claim about upstream
+    // behaviour in M150 and the only thing that settles it is running one —
+    // core/verify/ is where that belongs, and there is no verify script for
+    // extensions yet. Written down rather than assumed, because the failure
+    // mode is a browser that starts fine and loads nothing.
+    if !spec.extensions.is_empty() {
+        let list = spec
+            .extensions
+            .iter()
+            .map(|p| p.display().to_string())
+            .collect::<Vec<_>>()
+            .join(",");
+        args.push(format!("--disable-extensions-except={list}"));
+        args.push(format!("--load-extension={list}"));
+    }
+
+    if spec.restrictions.lock_devtools {
+        args.push("--fury-lock-devtools".to_string());
+    }
+    if spec.restrictions.lock_data_export {
+        args.push("--fury-lock-data-export".to_string());
+    }
+
+    // A background start, and both switches are needed.
+    //
+    // The first is ours (patch 0305): every window opens inactive, at the
+    // bottom of the z-order on Windows, and will not raise itself until the
+    // person activates one. Chrome takes its first show state from
+    // STARTUPINFO, which std::process::Command cannot set on stable Rust, so
+    // there is no way to ask for this from out here without the core's help.
+    //
+    // The second is upstream's. A window under other windows is "occluded",
+    // and Chrome marks occluded pages hidden: document.visibilityState turns
+    // "hidden", requestAnimationFrame stops and timers are throttled, so the
+    // page a script is driving would stop behaving like a page on a screen.
+    // With it, an occluded window counts as visible (WebContentsImpl, where it
+    // computes visibility). A minimized one is still hidden: minimizing is the
+    // person's choice, and a page in a minimized window is hidden in real
+    // Chrome too.
+    //
+    // Neither reaches a page. Both are visible in argv, like the lock switches.
+    if spec.headless {
+        args.push("--headless=new".to_string());
+    }
+
+    if spec.background {
+        args.push("--fury-background-window".to_string());
+        args.push("--disable-backgrounding-occluded-windows".to_string());
+    }
+
+    // A profile moves between machines, and a session bound to one cannot.
+    //
+    // On Windows with a TPM, Chrome ties a Google login to a key that never
+    // leaves the chip: the __Secure-*PSIDTS cookies have to be renewed by signing
+    // with it. A bundle carries the cookies and the wrapped key, the chip stays
+    // behind, and the next machine has nothing to sign with. Reported 04.11.2026
+    // on a team handing profiles from Windows to a MacBook: logged out of Google
+    // and of nothing else, on and off, with a TPM ready and
+    // bound_session_credentials_bound_session_params in five profiles'
+    // Preferences. With the kill switch the service is never created
+    // (BoundSessionCookieRefreshServiceFactory), so a new login stays portable. A
+    // session already bound still has to log in once more.
+    //
+    // DeviceBoundSessions is the same idea as a web standard for any site, on by
+    // default on Windows and macOS: a session whose key will not unwrap on the
+    // next machine is deleted (DeletionReason::kFailedToUnwrapKey).
+    //
+    // Neither reaches a page. To the site this is what a machine with no TPM
+    // already looks like, and it applies to every profile: a profile that lives
+    // on one machine today can be shared or restored tomorrow, and by then its
+    // sessions would already be bound.
+    args.push("--enable-features=BoundSessionCredentialsKillSwitch".to_string());
+    args.push("--disable-features=DeviceBoundSessions".to_string());
+
+    // CDP is full cookie access, so it is gated by export_cookies upstream of here.
+    match spec.debug_port {
+        Some(p) if !spec.restrictions.deny_cdp => {
+            args.push(format!("--remote-debugging-port={p}"));
+            args.push("--remote-allow-origins=*".to_string());
+        }
+        _ => {}
+    }
+
+    args.extend(spec.start_urls.iter().cloned());
+    args
+}
+
+/// Validate, then spawn.
+///
+/// Validation is fail-closed on purpose: launching an inconsistent profile is
+/// worse than not launching it, because the inconsistency is itself a signal.
+/// The deep consistency checks live on the persona this config was derived from
+/// — a valid persona cannot produce a contradictory config — so what is checked
+/// here is the other failure: a config the core will not understand.
+pub fn spawn(spec: &LaunchSpec) -> Result<std::process::Child, LaunchError> {
+    if let Err(missing) = fury_shared::fingerprint::check_core_config(spec.config) {
+        let msg = missing
+            .iter()
+            .map(|e| format!("  - {e}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        return Err(LaunchError::Inconsistent(msg));
+    }
+
+    if !spec.core_binary.exists() {
+        return Err(LaunchError::CoreMissing(spec.core_binary.to_path_buf()));
+    }
+
+    // The Widevine CDM, into this profile and not into the signed core: see
+    // widevine.rs. Never fatal, like the staging at startup on other systems:
+    // a profile without DRM opens, one that refuses to open is an outage.
+    // Idempotent, and an APFS clone, so a launch does not wait on 19 MB.
+    #[cfg(target_os = "macos")]
+    if !spec.headless {
+        match crate::widevine::stage_into_profile(spec.user_data_dir) {
+            Ok(s) => tracing::debug!(to = %s.to.display(), "Widevine CDM in the profile"),
+            Err(e) => tracing::warn!(
+                error = %e,
+                "no Widevine CDM for this profile — DRM video will not play, and \
+                 requestMediaKeySystemAccess will refuse where real Chrome accepts"
+            ),
+        }
+    }
+
+    // After the CDM: both are best effort, and neither may stop a launch.
+    // Kept to the end of this function, past the spawn: until the browser runs
+    // from the copy, dock::tidy would see a copy nothing uses and delete it.
+    #[cfg(target_os = "macos")]
+    let named = spec.dock_name.and_then(|(id, name)| {
+        match crate::dock::named_core(spec.core_binary, id, name) {
+            Ok(named) => Some(named),
+            Err(e) => {
+                tracing::warn!(error = %e, "running the core under its own name; the Dock will say Fury");
+                None
+            }
+        }
+    });
+    #[cfg(target_os = "macos")]
+    let core_binary = named.as_ref().map_or(spec.core_binary, |n| n.exe.as_path());
+    #[cfg(not(target_os = "macos"))]
+    let core_binary = spec.core_binary;
+
+    let mut cmd = std::process::Command::new(core_binary);
+    cmd.args(build_args(spec)).stdin(Stdio::null());
+
+    // The config arrives as an inherited open file — fd 3 on macOS, a HANDLE on
+    // Windows — which the core reads to EOF (components/fury/fury_config.cc).
+    // Both carriers have to stay alive until spawn returns: the child gets a
+    // copy of the descriptor or handle, but only while this one is open.
+    let json = serde_json::to_vec(spec.config)
+        .map_err(|e| LaunchError::Io(std::io::Error::new(std::io::ErrorKind::InvalidData, e)))?;
+    let config = Carrier::new(&json, 3)?;
+
+    // The key rides the same way and for the same reason: a key on the command
+    // line is a key any other process on the machine can read out of `ps` or
+    // Task Manager.
+    let oscrypt = match spec.os_crypt_key {
+        Some(key) => Some(Carrier::new(&key, 4)?),
+        None => None,
+    };
+
+    cmd.args(carrier_switches(&config, oscrypt.as_ref()));
+    config.attach(&mut cmd);
+    if let Some(c) = &oscrypt {
+        c.attach(&mut cmd);
+    }
+
+    let child = cmd.spawn()?;
+    drop(config);
+    drop(oscrypt);
+    Ok(child)
+}
+
+/// The switches that tell the core where its inherited files landed.
+///
+/// Only the slot is visible in argv — a descriptor number on macOS, a handle
+/// value on Windows. That is the whole point of the carrier; see
+/// `fury_platform::carrier`.
+fn carrier_switches(config: &Carrier, oscrypt: Option<&Carrier>) -> Vec<String> {
+    let mut out = vec![config.switch("fury-fp")];
+    if let Some(key) = oscrypt {
+        out.push(key.switch("fury-oscrypt"));
+    }
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn an_unclean_exit_is_forgotten_and_nothing_else_changes() {
+        let root = std::env::temp_dir().join(format!("fury-exit-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("Default")).unwrap();
+        let prefs = root.join("Default").join("Preferences");
+        std::fs::write(&prefs, r#"{"profile":{"exit_type":"Crashed","name":"x"},"other":{"a":1}}"#).unwrap();
+        assert!(super::forget_unclean_exit(&root));
+        let v: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&prefs).unwrap()).unwrap();
+        assert_eq!(v["profile"]["exit_type"], "Normal");
+        assert_eq!(v["profile"]["name"], "x");
+        assert_eq!(v["other"]["a"], 1);
+
+        // A clean or forced-shutdown exit, a missing file, and garbage are left alone.
+        std::fs::write(&prefs, r#"{"profile":{"exit_type":"SessionEnded"}}"#).unwrap();
+        assert!(!super::forget_unclean_exit(&root));
+        std::fs::write(&prefs, "not json").unwrap();
+        assert!(!super::forget_unclean_exit(&root));
+        assert_eq!(std::fs::read_to_string(&prefs).unwrap(), "not json");
+        assert!(!super::forget_unclean_exit(&root.join("nowhere")));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    use super::*;
+    use fury_shared::rbac::{effective, OrgRole, PermSet};
+
+    /// A real derived config, not a hand-written one — these tests exist to
+    /// check the thing that actually gets launched.
+    fn sample_config() -> serde_json::Value {
+        let persona: fury_shared::persona::Persona = serde_json::from_str(include_str!(
+            "../../shared/personas/macos-15-m-series-1728x1117.json"
+        ))
+        .expect("shipped persona parses");
+        persona.derive_core_config(
+            1,
+            &fury_shared::persona::ProfileContext {
+                timezone: "Europe/Berlin".into(),
+                languages: vec!["de-DE".into(), "de".into()],
+                ui_locale: "de".into(),
+                geolocation: Some((52.52, 13.405)),
+                chrome_major: 155,
+                chrome_full_version: "155.0.8059.39".into(),
+            },
+        )
+    }
+
+    fn spec_for(restrictions: LaunchRestrictions, cfg: &serde_json::Value) -> LaunchSpec<'_> {
+        LaunchSpec {
+            dock_name: None,
+            extensions: &[],
+            core_binary: Path::new("/nonexistent/Fury"),
+            user_data_dir: Path::new("/tmp/p"),
+            config: cfg,
+            relay_port: 41000,
+            restrictions,
+            start_urls: &[],
+            debug_port: Some(9222),
+            background: false,
+            headless: false,
+            os_crypt_key: None,
+            ui_locale: "de",
+        }
+    }
+
+    #[test]
+    fn operator_launch_is_hardened_and_gets_no_cdp() {
+        let perms = effective(OrgRole::Member, Some(PermSet::operator()));
+        let r = LaunchRestrictions::for_perms(perms);
+        let cfg = sample_config();
+        let args = build_args(&spec_for(r, &cfg));
+
+        assert!(!args.iter().any(|a| a.starts_with("--remote-debugging-port")));
+        assert!(args.iter().any(|a| a == "--fury-lock-devtools"));
+        assert!(args.iter().any(|a| a == "--fury-lock-data-export"));
+    }
+
+    #[test]
+    fn no_session_gets_bound_to_the_machine_it_was_opened_on() {
+        // A profile travels and a TPM does not. Chromium keeps only the last
+        // --enable-features and --disable-features it is given, so a second one
+        // added anywhere would silently undo these: each appears exactly once.
+        let cfg = sample_config();
+        let spec = spec_for(LaunchRestrictions::for_perms(PermSet::full_profile_work()), &cfg);
+        let args = build_args(&spec);
+        let enable: Vec<_> = args.iter().filter(|a| a.starts_with("--enable-features=")).collect();
+        let disable: Vec<_> = args.iter().filter(|a| a.starts_with("--disable-features=")).collect();
+        assert_eq!(enable, ["--enable-features=BoundSessionCredentialsKillSwitch"]);
+        assert_eq!(disable, ["--disable-features=DeviceBoundSessions"]);
+    }
+
+    #[test]
+    fn a_background_start_asks_for_both_switches_and_a_plain_one_for_neither() {
+        // Patch 0305 reads the first, and without the second a window under
+        // other windows turns its pages hidden: the start would be quiet and
+        // the page behind it throttled. Spelled here the way the core spells
+        // it in fury_switches.cc; nothing else checks the two match.
+        let cfg = sample_config();
+        let mut spec = spec_for(LaunchRestrictions::for_perms(PermSet::full_profile_work()), &cfg);
+        let plain = build_args(&spec);
+        assert!(!plain.iter().any(|a| a == "--fury-background-window"));
+        assert!(!plain.iter().any(|a| a == "--disable-backgrounding-occluded-windows"));
+
+        spec.background = true;
+        let quiet = build_args(&spec);
+        assert!(quiet.iter().any(|a| a == "--fury-background-window"));
+        assert!(quiet.iter().any(|a| a == "--disable-backgrounding-occluded-windows"));
+    }
+
+    #[test]
+    fn the_ui_locale_reaches_the_core_and_matches_the_config() {
+        // The two halves of one fact. `--lang` is what sets the ICU default and
+        // therefore every Intl answer; `locale.locale` is what the config says
+        // the profile claims. They are computed from one value on purpose, and
+        // a launch where they disagree is a browser announcing German and
+        // formatting numbers in Russian — which is what the capture in
+        // baselines/final.json actually shows, and what this guards.
+        let cfg = sample_config();
+        let r = LaunchRestrictions::for_perms(PermSet::full_profile_work());
+        let spec = spec_for(r, &cfg);
+        let args = build_args(&spec);
+
+        assert!(
+            args.iter().any(|a| a == "--lang=de"),
+            "no --lang in {args:?}"
+        );
+        assert_eq!(
+            cfg["locale"]["locale"], "de",
+            "the config must claim the locale the core is launched with"
+        );
+
+        // And it must be a locale Chrome ships strings for. Anything else and
+        // ResourceBundle silently falls back to en-US, leaving the browser
+        // formatting in a language the profile never claimed.
+        assert_eq!(
+            fury_shared::locale::ui_locale_for(Some(spec.ui_locale)),
+            spec.ui_locale
+        );
+    }
+
+    #[test]
+    fn everything_routes_through_the_relay() {
+        let cfg = sample_config();
+        let r = LaunchRestrictions::for_perms(PermSet::full_profile_work());
+        let args = build_args(&spec_for(r, &cfg));
+
+        assert!(args.iter().any(|a| a == "--proxy-server=http://127.0.0.1:41000"));
+        assert!(args.iter().any(|a| a == "--disable-quic"));
+        // Not networking, but the same class of problem: a build setting that
+        // silently makes this browser behave unlike the one it claims to be.
+        assert!(args.iter().any(|a| a == "--disable-field-trial-config"));
+        // An elevated browser must not relaunch itself away from the
+        // handles it inherited (issue 38).
+        #[cfg(windows)]
+        assert!(args.iter().any(|a| a == "--do-not-de-elevate"));
+    }
+
+    #[test]
+    fn the_cookie_key_is_offered_only_when_there_is_one() {
+        // A profile with no key of its own must not claim a slot that carries
+        // nothing: the core would read zero bytes, log, and fall back — but the
+        // switch would be there in `ps` saying otherwise.
+        let config = Carrier::new(b"{}", 3).unwrap();
+        let without = carrier_switches(&config, None);
+        assert_eq!(without.len(), 1, "{without:?}");
+        assert!(!without.iter().any(|a| a.starts_with("--fury-oscrypt")), "{without:?}");
+
+        let key = Carrier::new(&[7u8; 32], 4).unwrap();
+        let with = carrier_switches(&config, Some(&key));
+        assert!(with.iter().any(|a| a.starts_with("--fury-oscrypt-")), "{with:?}");
+        // And never in argv itself. The whole reason it travels on an inherited
+        // file is that `ps` — and Task Manager — are readable by every process
+        // on the machine.
+        assert!(
+            !with.iter().any(|a| a.contains("07070707")),
+            "the key must not appear on the command line: {with:?}"
+        );
+    }
+
+    #[test]
+    fn the_switches_that_must_not_come_back() {
+        let cfg = sample_config();
+        let r = LaunchRestrictions::for_perms(PermSet::full_profile_work());
+        let mut spec = spec_for(r, &cfg);
+        spec.os_crypt_key = Some([7u8; 32]);
+        let args = build_args(&spec);
+        // The other UDP path out is NOT handled here any more, and the absence
+        // is asserted so nobody puts it back. This switch was passed on every
+        // launch for weeks and read by nobody — see the note in build_args. The
+        // profile's WebRTC routing is patch 0070's job now, through the
+        // preference Chrome actually consults.
+        assert!(!args.iter().any(|a| a.contains("webrtc-ip-handling")));
+        // Widevine dies with this switch present — see the note in build_args.
+        // Asserted rather than remembered: it reads like an obvious hardening
+        // flag, and putting it back costs every profile its DRM playback and
+        // fails the release gate.
+        assert!(!args.iter().any(|a| a.contains("disable-component-update")));
+        // Without it a profile reopens as a blank new tab and the last
+        // session's tabs are gone — see the note in build_args.
+        assert!(args.iter().any(|a| a == "--restore-last-session"));
+        assert!(!args.iter().any(|a| a.contains("--no-proxy-server")));
+    }
+
+    #[test]
+    fn extensions_are_passed_as_a_pair_or_not_at_all() {
+        let cfg = sample_config();
+        let r = LaunchRestrictions::for_perms(PermSet::full_profile_work());
+
+        // None installed: NEITHER switch. `--load-extension=` with an empty
+        // list is not the same as absent — Chromium warns on every start.
+        let args = build_args(&spec_for(r.clone(), &cfg));
+        assert!(!args.iter().any(|a| a.starts_with("--load-extension")), "{args:?}");
+        assert!(!args.iter().any(|a| a.starts_with("--disable-extensions-except")), "{args:?}");
+
+        // Two installed: both switches, same list, comma-separated. Passing
+        // --load-extension alone is what current Chrome ignores.
+        let dirs = [
+            std::path::PathBuf::from("/p/Fury Extensions/aaaa"),
+            std::path::PathBuf::from("/p/Fury Extensions/bbbb"),
+        ];
+        let mut spec = spec_for(r, &cfg);
+        spec.extensions = &dirs;
+        let args = build_args(&spec);
+
+        let load = args.iter().find(|a| a.starts_with("--load-extension=")).expect("no --load-extension");
+        let except = args
+            .iter()
+            .find(|a| a.starts_with("--disable-extensions-except="))
+            .expect("no --disable-extensions-except");
+        assert_eq!(
+            load.trim_start_matches("--load-extension="),
+            except.trim_start_matches("--disable-extensions-except="),
+            "the two switches must name the same set"
+        );
+        assert!(load.contains("aaaa") && load.contains("bbbb"), "{load}");
+        assert_eq!(load.matches(',').count(), 1, "one separator for two paths: {load}");
+    }
+
+    #[test]
+    fn config_never_appears_in_argv() {
+        let cfg = sample_config();
+        let r = LaunchRestrictions::for_perms(PermSet::full_profile_work());
+        let args = build_args(&spec_for(r, &cfg));
+        let joined = args.join(" ");
+        assert!(!joined.contains("webgl"), "fingerprint leaked into argv");
+        assert!(!joined.contains(cfg["navigator"]["userAgent"].as_str().unwrap()));
+        // The switch is not in build_args any more — it names a slot that only
+        // exists once the carrier does. That it is passed at all is
+        // `carrier_switches`, tested above; that it carries no payload is
+        // `fury_platform::carrier`.
+        assert!(!joined.contains("--fury-fp-"), "the slot is decided at spawn: {joined}");
+    }
+
+    #[test]
+    fn a_config_the_core_cannot_read_refuses_to_launch() {
+        // The exact mistake this guards: handing over FingerprintConfig, whose
+        // keys are snake_case, so every lookup in the core misses and the
+        // profile silently reports the host machine.
+        let wrong = serde_json::to_value(fury_shared::fingerprint::samples::macos_arm64()).unwrap();
+        let r = LaunchRestrictions::for_perms(PermSet::full_profile_work());
+        let err = spawn(&spec_for(r, &wrong)).unwrap_err();
+        assert!(matches!(err, LaunchError::Inconsistent(_)), "got {err:?}");
+    }
+
+    #[test]
+    fn a_config_missing_one_key_refuses_to_launch() {
+        let mut cfg = sample_config();
+        cfg["noise"].as_object_mut().unwrap().remove("canvasSeed");
+        let r = LaunchRestrictions::for_perms(PermSet::full_profile_work());
+        let err = spawn(&spec_for(r, &cfg)).unwrap_err();
+        assert!(matches!(err, LaunchError::Inconsistent(_)), "got {err:?}");
+    }
+
+    #[test]
+    fn a_real_canvas_is_a_decision_and_passes_while_a_lost_seed_still_does_not() {
+        use fury_shared::overrides::{CanvasMode, MachineOverrides};
+        let mut cfg = sample_config();
+        MachineOverrides { canvas: Some(CanvasMode::Real), ..Default::default() }.apply_config(&mut cfg);
+        assert!(cfg["noise"].get("canvasSeed").is_none());
+        fury_shared::fingerprint::check_core_config(&cfg).expect("real canvas is allowed");
+
+        // The marker is what makes it allowed; the same config without it is
+        // the forgotten seed the check exists for.
+        cfg["noise"].as_object_mut().unwrap().remove("canvas");
+        assert!(fury_shared::fingerprint::check_core_config(&cfg).is_err());
+    }
+}

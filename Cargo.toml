@@ -1,0 +1,47 @@
+[workspace]
+resolver = "2"
+members = ["server", "agent", "shared-rs", "platform-rs", "tools/detect-suite", "desktop/src-tauri"]
+
+[workspace.package]
+version = "0.6.9"
+edition = "2021"
+rust-version = "1.80"
+license = "AGPL-3.0-or-later"
+repository = "https://github.com/furyteamtop/fury-antidetect-browser"
+
+[workspace.dependencies]
+anyhow = "1"
+thiserror = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["full"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+uuid = { version = "1", features = ["v7", "serde"] }
+time = { version = "0.3", features = ["serde", "formatting"] }
+sha2 = "0.10"
+sha1 = "0.10"
+hmac = "0.12"
+digest = "0.10"
+rand = "0.8"
+
+[patch.crates-io]
+# One small change to smoltcp, the TCP stack inside WireGuard tunnels: the SYN's
+# window scale is set per persona. agent/vendor/smoltcp/FURY.md says what and why.
+# (Inside this section on purpose: tools/ci/gen-deploy-workspace.py copies
+# [workspace.dependencies] up to the next header, comments included.)
+smoltcp = { path = "agent/vendor/smoltcp" }
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = true
+
+# Proc-macros and build scripts are not shipped, and stripping them broke the
+# release build on 08.10.2026 (rustc 1.97.1, ld-27037.1): the stripped
+# libsqlx_macros.dylib had a "mis-aligned LINKEDIT string pool" that dlopen
+# refuses, so `sqlx` could not compile; unstripped it loads. It surfaced when
+# the rustls bump rebuilt sqlx-macros for the first time in a while. The
+# binaries above stay stripped.
+[profile.release.build-override]
+strip = false
