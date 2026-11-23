@@ -32,3 +32,7 @@
 
 # PowerShell is the one place CRLF is the native convention.
 *.ps1 text eol=crlf
+
+# Hermes profile snapshot: CHECKSUMS.sha256 is byte-exact. Any conversion here
+# breaks `sha256sum -c` after a fresh clone, so store these files verbatim.
+hermes-profile/** -text
