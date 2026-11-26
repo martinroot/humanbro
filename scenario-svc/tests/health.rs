@@ -9,7 +9,12 @@ use tower::ServiceExt;
 async fn healthz_returns_ok(pool: sqlx::PgPool) {
     let app = scenario_svc::router(Arc::new(scenario_svc::AppState { db: pool }));
     let res = app
-        .oneshot(Request::builder().uri("/healthz").body(Body::empty()).unwrap())
+        .oneshot(
+            Request::builder()
+                .uri("/healthz")
+                .body(Body::empty())
+                .unwrap(),
+        )
         .await
         .unwrap();
     assert_eq!(res.status(), 200);
