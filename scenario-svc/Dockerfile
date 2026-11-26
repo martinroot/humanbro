@@ -5,6 +5,8 @@ COPY shared-rs ./shared-rs
 COPY server ./server
 COPY scenario-svc ./scenario-svc
 COPY agent ./agent
+COPY platform-rs ./platform-rs
+COPY desktop ./desktop
 COPY tools ./tools
 COPY shared ./shared
 RUN cargo build --release -p scenario-svc
