@@ -16,8 +16,8 @@ use std::sync::Arc;
 
 use axum::extract::FromRequestParts;
 use axum::http::request::Parts;
+use fury_shared::hash_token;
 use fury_shared::rbac::{OrgRole, PermSet};
-use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 use crate::error::ApiError;
@@ -73,10 +73,6 @@ pub fn token_hash_from_headers(headers: &axum::http::HeaderMap) -> Option<Vec<u8
         .and_then(|v| v.to_str().ok())
         .and_then(|v| v.strip_prefix("Bearer "))
         .map(hash_token)
-}
-
-pub fn hash_token(raw: &str) -> Vec<u8> {
-    Sha256::digest(raw.as_bytes()).to_vec()
 }
 
 fn hex(bytes: &[u8]) -> String {
