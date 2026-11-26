@@ -4197,6 +4197,27 @@ dependencies = [
 ]
 
 [[package]]
+name = "scenario-svc"
+version = "0.6.9"
+dependencies = [
+ "anyhow",
+ "axum",
+ "fury-shared",
+ "http-body-util",
+ "serde",
+ "serde_json",
+ "sha2",
+ "sqlx",
+ "time",
+ "tokio",
+ "tower",
+ "tower-http",
+ "tracing",
+ "tracing-subscriber",
+ "uuid",
+]
+
+[[package]]
 name = "schannel"
 version = "0.1.29"
 source = "registry+https://github.com/rust-lang/crates.io-index"
