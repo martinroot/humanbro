@@ -59,3 +59,31 @@ tail -1 /home/main/.hermes/plugins/token-usage-footer/usage.jsonl
 
 The footer is appended after the model turn, so it cannot enter the prompt or
 invalidate prompt caching. `USD` is an estimate, not billing.
+
+## Diagnosis 2026-11-26: "footer not showing"
+
+The re-sent `token-usage-footer-installed.tar.gz` is byte-identical to the first
+one (SHA-256 `81702bee…` / `c967dfa7…`) — the archive was not the problem.
+
+The plugin was healthy in the two places it had actually been installed:
+
+- Linux host `server-szpf` (94.183.186.98), `/home/main/.hermes`: doctor OK with
+  2 hooks, `stamped turn` in `agent.log` (36 entries, last 10:51), `usage.jsonl`
+  written at 10:51, gateway service active.
+- Windows profile `AppData/Local/hermes`: 165 stamped turns, `usage.jsonl`
+  appended at 13:58.
+
+The chat that complained runs under a THIRD profile —
+`AppData/Local/hermes-standalone-githumanbro` — where `plugins.enabled: []` and
+no `plugins/token-usage-footer` directory existed. No plugin, no footer.
+
+Fix applied in that active profile: copied `__init__.py` + `plugin.yaml` into
+`plugins/token-usage-footer/`, ran `hermes plugins doctor` (OK, 0 tools / 2 hooks),
+enabled with `hermes plugins enable token-usage-footer --no-allow-tool-override`,
+and proved it with
+`HERMES_TOKEN_USAGE_FOOTER_ALL=1 hermes -z "Ответь одним словом: ок"` — the
+`⚙️ IN=14008|OUT=31|…` line appeared and a fresh `usage.jsonl` row was written.
+
+A gateway that was already running still needs `/restart` in chat before its own
+future replies carry the footer; the agent must not restart it from a shell
+inside the gateway process.
