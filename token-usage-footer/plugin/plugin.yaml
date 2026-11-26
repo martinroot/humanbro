@@ -1,0 +1,10 @@
+name: token-usage-footer
+version: "1.0.0"
+description: "Appends a per-turn accounting line (uncached input / output / cache read+write / API calls / wall time / estimated cost) to every messaging reply."
+author: srv-94
+hooks:
+  - post_api_request
+  - transform_llm_output
+provides_hooks:
+  - post_api_request
+  - transform_llm_output
