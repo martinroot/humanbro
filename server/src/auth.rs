@@ -16,7 +16,7 @@ use std::sync::Arc;
 
 use axum::extract::FromRequestParts;
 use axum::http::request::Parts;
-use fury_shared::hash_token;
+pub use fury_shared::hash_token;
 use fury_shared::rbac::{OrgRole, PermSet};
 use uuid::Uuid;
 
