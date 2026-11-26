@@ -21,6 +21,10 @@ services:
       POSTGRES_USER: fury
       POSTGRES_PASSWORD: ${FURY_DB_PASSWORD:?set FURY_DB_PASSWORD in .env}
       POSTGRES_DB: fury
+    # Loopback only: sqlx::test and psql reach it over an SSH tunnel from the
+    # operator box; nothing on the public interface can see the database.
+    ports:
+      - "127.0.0.1:5432:5432"
     volumes:
       - fury-db:/var/lib/postgresql/data
     healthcheck:
@@ -52,6 +56,23 @@ services:
     # whose bytes are gone. Back this up together with fury-db (docs/14).
     volumes:
       - fury-bundles:/var/lib/fury/bundles
+
+  scenario-svc:
+    build:
+      context: .
+      dockerfile: scenario-svc/Dockerfile
+    restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgres://fury:${FURY_DB_PASSWORD}@db:5432/fury
+      BIND: 0.0.0.0:8902
+      RUST_LOG: info
+    # Loopback only. No secrets in the service: it authenticates with Fury
+    # session tokens and reads the same RLS-protected schema.
+    ports:
+      - "127.0.0.1:8902:8902"
 
 volumes:
   fury-db:
