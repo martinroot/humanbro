@@ -136,3 +136,27 @@ Linux или Chrome+CDP для задач, где не нужна подмена
 - Не открывать CDP наружу и не включать `gateway.allow_all_users` «для удобства».
 - Строка `⚙️ IN=…|USD=…` — оценка, не биллинг; для учёта сценариев использовать
   `scenario_events`, а не токенный футер.
+
+## 8. Что реально сделано 26.11 (фазы 0–1)
+
+- VDS `94.183.186.98`: освобождено ~1,3 ГБ (`apt-get clean` + `journalctl --vacuum-size=200M`),
+  поставлены `docker.io` и `docker-compose-v2` (пакет `docker-compose-plugin` в Ubuntu 24.04
+  отсутствует), подняты `db`, `server`, `scenario-svc`. Проверки:
+  `/v1/me` → `401 {"error":"unauthenticated"}`,
+  `/healthz` → `{"ok":true,"service":"scenario-svc"}`, `scn` — 5 таблиц.
+- `docker-compose.yml` публикует Postgres только на `127.0.0.1:5432`: `sqlx::test` и `psql`
+  ходят туда через SSH-туннель. Сборка `scenario-svc` идёт из исходников; Dockerfile обязан
+  копировать **все** workspace-члены (`platform-rs`, `desktop/src-tauri` включительно),
+  иначе `cargo build` падает на загрузке манифеста workspace.
+- Важно: готовый образ `fury-server` содержит миграции, вкомпилированные на этапе сборки
+  (`sqlx::migrate!`). Миграцию `0023_scenarios.sql` на текущем VDS пришлось применить
+  вручную: `docker compose exec -T db psql -U fury -d fury < 0023_scenarios.sql`.
+  При сборке сервера из исходников она применится сама.
+- Диск во время release-сборки закончился (0 байт), Postgres ушёл в recovery; после
+  `docker builder prune -f` (+2,5 ГБ) контейнеры поднялись нормально. `/var/www/bustyvault.buzz`
+  (45 ГБ) не трогался.
+- Тесты: 130 тестов `fury-shared` + 4 интеграционных теста `scenario-svc`
+  (migration/health/auth/scenarios) — все зелёные; `cargo check -p fury-server` — ok.
+- На Windows для `cargo test` потребовались Visual Studio BuildTools (VCTools) и переменная
+  `LIB` с путями MSVC/Windows SDK; без неё `link.exe` не находил `dbghelp.lib`.
+
